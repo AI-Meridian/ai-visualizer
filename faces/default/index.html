@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Meridian</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#080b1a;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  /* real <img>, not canvas-drawn — the canvas backing store is capped to
+     1x device pixels for performance (see resize() below), which blurs
+     anything crisp drawn into it on a retina screen. A native <img>
+     renders through the browser's own compositor at full display
+     resolution regardless, same fix core.js already uses for the task
+     panel's text. */
+  #logo-wrap{position:fixed;left:28px;top:28px;width:44px;height:40px;overflow:hidden;z-index:40;pointer-events:none}
+  #logo-wrap img{display:block;height:40px;width:auto}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="logo-wrap"><img src="assets/meridian-mark.png" alt=""></div>
+<script src="../../core.js"></script>
+<script>
+/* ============================================================
+   Default face: the calm baseline — the same brand orb as the
+   other Meridian faces, sitting under one wide, shallow arc of
+   light plus a soft ground-reflection glow. No second ring, no
+   coil, no travelling pulses — the quiet one.
+   ============================================================ */
+"use strict";
+// Meridian's own activation chime, not Jared's generic thinking.wav.
+// core.js (one of the four unmodified upstream components) always loads
+// its own shared assets/thinking.wav with no override hook exposed, and
+// it's not this project's file to edit — so the swap happens here, at
+// the face level, via a temporary Audio() patch active only for the
+// single synchronous instant core.js's own soundInit() constructs its
+// player (inside AV.init, called synchronously below, nothing async
+// in between). Restored immediately after, so nothing else is affected.
+(() => {
+  const RealAudio = window.Audio;
+  window.Audio = function (src) {
+    const a = new RealAudio(
+      src && String(src).includes("thinking.wav") ? "assets/activate-chime.wav" : src
+    );
+    // Preview-only: the demo script's own "thinking" phase (core.js,
+    // 4.2s) is shorter than this chime (~11s), so core.js's stopSound()
+    // would cut it short. Just no-op'ing pause() wasn't enough — that
+    // function also sets currentTime = 0 right after pause(), which
+    // still rewound the still-running clip back to the start, sounding
+    // like a restart rather than one clean play-through. Swallow
+    // exactly that one paired reset (and only that one) so the
+    // legitimate "start fresh" reset before each real play() call still
+    // works normally on every later cycle. AV.demo is never true in a
+    // real install, so production behavior (cut off when thinking
+    // actually ends) is untouched.
+    if (AV.demo) {
+      let swallowNextSeek = false;
+      a.pause = () => { swallowNextSeek = true; };
+      const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime");
+      Object.defineProperty(a, "currentTime", {
+        get() { return desc.get.call(a); },
+        set(v) {
+          if (swallowNextSeek) { swallowNextSeek = false; return; }
+          desc.set.call(a, v);
+        }
+      });
+    }
+    return a;
+  };
+  AV.init({});
+  window.Audio = RealAudio;
+})();
+AV.ready(a => { document.title = a.name || "Meridian"; });
+
+if (AV.demo && !new URLSearchParams(location.search).get("name")){
+  AV.name = "Meridian";
+  AV.label = "M.E.R.I.D.I.A.N.";
+}
+
+(() => {
+  const s = document.createElement("style");
+  s.textContent = `
+    #av-task-panel{
+      background: rgba(20,28,56,0.72);
+      border: 1px solid rgba(138,107,255,0.35);
+      border-radius: 16px;
+      box-shadow: 0 1px 0 rgba(255,255,255,.14) inset, 0 8px 24px rgba(79,195,255,.15), 0 0 22px rgba(138,107,255,.14);
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      font-family: -apple-system, "SF Pro Display", sans-serif;
+    }
+    #av-task-panel .av-task-head{ color: rgba(191,228,255,0.9); }
+    #av-task-panel .av-task-dot{ background: linear-gradient(90deg,#4fc3ff,#8a6bff); }
+    #av-task-panel .av-task-label{ color: rgba(236,242,250,0.95); }
+    #av-task-panel .av-task-bars i{ background: linear-gradient(180deg,#4fc3ff,#8a6bff); }
+  `;
+  document.head.appendChild(s);
+})();
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1, cx = 0, cy = 0, R = 0;
+
+// the orb, shared across every Meridian face — same asset, same crop,
+// same exposure technique, only the background around it changes
+const orbitRef = new Image();
+let orbitRefReady = false;
+orbitRef.onload = () => { orbitRefReady = true; };
+orbitRef.src = "assets/orbit-reference.png";
+const ORBIT_REF_SRC = { sx: 140, sy: 137, sw: 980, sh: 980 };
+
+function resize(){
+  // capped at 1x, not 2x — the background/arc gradients this face
+  // repaints are the real cost, and halving the pixel count per axis on a
+  // retina display cuts that by ~4x, the single biggest lever for
+  // low-power machines
+  DPR = Math.min(1, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W / 2; cy = H * 0.44;
+  R = Math.min(H, W) * 0.135;
+}
+addEventListener("resize", resize);
+resize();
+
+function roundRectPath(g, x, y, w, h, r){
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+const BREATHE_AMT = { idle: 0.03, listening: 0.045, thinking: 0.03, speaking: 0.0 };
+const BREATHE_HZ  = { idle: 0.35, listening: 0.55, thinking: 0.9,  speaking: 0 };
+const ARC_ACTIVE  = { idle: 0, listening: 0.15, thinking: 0.55, speaking: 0.9 };
+
+let clock = 0;
+let shimmerPhase = 0;
+let secondaryPhase = 0;
+let workFade = 0;
+
+function drawBackground(gctx, clock){
+  gctx.fillStyle = "#05060f";
+  gctx.fillRect(0, 0, W, H);
+
+  const driftB = Math.sin(clock * 0.05) * 0.035;
+  const blueX = W * (0.32 + driftB), blueY = H * (0.14 - driftB * 0.6);
+  const blueA = 0.85 + Math.sin(clock * 0.045) * 0.15;
+  const blue = gctx.createRadialGradient(blueX, blueY, 0, blueX, blueY, Math.max(W, H) * 0.62);
+  blue.addColorStop(0, `rgba(20,55,150,${0.68 * blueA})`);
+  blue.addColorStop(0.55, `rgba(12,32,100,${0.36 * blueA})`);
+  blue.addColorStop(1, "rgba(12,32,100,0)");
+  gctx.fillStyle = blue;
+  gctx.fillRect(0, 0, W, H);
+
+  const driftP = Math.sin(clock * 0.038 + 2.1) * 0.035;
+  const purpX = W * (0.78 + driftP), purpY = H * (0.78 - driftP * 0.5);
+  const purpA = 0.85 + Math.sin(clock * 0.052 + 1.4) * 0.15;
+  const purple = gctx.createRadialGradient(purpX, purpY, 0, purpX, purpY, Math.max(W, H) * 0.58);
+  purple.addColorStop(0, `rgba(85,20,165,${0.42 * purpA})`);
+  purple.addColorStop(0.55, `rgba(42,14,95,${0.22 * purpA})`);
+  purple.addColorStop(1, "rgba(42,14,95,0)");
+  gctx.fillStyle = purple;
+  gctx.fillRect(0, 0, W, H);
+}
+
+// Every drift term above is sub-0.1Hz — nothing in this background moves
+// fast enough for the eye to tell 10 repaints/sec from 60. Baked to an
+// offscreen sprite and only repainted on that slower clock, same
+// sprite-cache lesson as the arc taper below, just keyed on elapsed time
+// instead of a fixed parameter tuple since this one drifts continuously
+// rather than switching between discrete states.
+let bgSprite = null, bgSpriteW = 0, bgSpriteH = 0, bgSpriteClock = -999;
+const BG_REFRESH_SEC = 1 / 10;
+function getBackgroundSprite(clock){
+  if (!bgSprite) bgSprite = document.createElement("canvas");
+  const resized = bgSpriteW !== W || bgSpriteH !== H;
+  if (resized || clock - bgSpriteClock >= BG_REFRESH_SEC){
+    bgSprite.width = W; bgSprite.height = H;
+    drawBackground(bgSprite.getContext("2d"), clock);
+    bgSpriteW = W; bgSpriteH = H; bgSpriteClock = clock;
+  }
+  return bgSprite;
+}
+
+/* Finds the angle on a tilted ellipse (centered at local origin, before
+   translate/rotate) where its world X position crosses a target offset
+   from center — by bisection, since the tilt makes the closed-form
+   messy. Used so the arc's visible ends always reach past whatever the
+   current window width actually is, instead of a fixed degree range
+   tuned for one window size: widen the browser and the math re-solves
+   itself every frame, the line never visibly runs out. */
+function worldXAt(t, rx, ry, tilt){
+  return Math.cos(t) * rx * Math.cos(tilt) - Math.sin(t) * ry * Math.sin(tilt);
+}
+function edgeAngles(rx, ry, tilt){
+  const target = W / 2 + R * 1.5;
+  let lo = 0, hi = Math.PI / 2 * 0.999;
+  for (let i = 0; i < 36; i++){
+    const mid = (lo + hi) / 2;
+    if (worldXAt(mid, rx, ry, tilt) > target) lo = mid; else hi = mid;
+  }
+  const a2 = (lo + hi) / 2;
+  let lo2 = Math.PI / 2 * 1.001, hi2 = Math.PI * 0.999;
+  for (let i = 0; i < 36; i++){
+    const mid = (lo2 + hi2) / 2;
+    if (worldXAt(mid, rx, ry, tilt) < -target) hi2 = mid; else lo2 = mid;
+  }
+  const a1 = (lo2 + hi2) / 2;
+  return { a1, a2 };
+}
+
+/* The arc stroke itself, tapered — thicker at the two visible ends,
+   narrower through the middle where it passes behind the orb. Built the
+   same way the Orbit face's ring-tip bloom is: many short, fine strokes
+   with continuously varying width and alpha, not a handful of discrete
+   bands (the earlier version, which read as visible rectangular steps
+   rather than a smooth gradient). That many shadowed strokes is real
+   cost if paid every frame, so — same fix as the Orbit ring tips — it's
+   rendered once onto an offscreen sprite, cached by its own parameters,
+   and just stamped back with drawImage until something actually changes
+   (window resize, state-driven width/blur change).
+*/
+let arcTaperSprite = null;
+let arcTaperSpriteKey = "";
+
+function getArcTaperSprite(a1, a2, rx, ry, tilt, originY, baseWidth, endWidth, blur, alphaMult){
+  const key = `${W}x${H}|${a1.toFixed(4)}|${a2.toFixed(4)}|${rx.toFixed(1)}|${tilt.toFixed(4)}|${originY.toFixed(1)}|${baseWidth.toFixed(2)}|${endWidth.toFixed(2)}|${blur.toFixed(1)}|${alphaMult.toFixed(3)}`;
+  if (arcTaperSprite && arcTaperSpriteKey === key) return arcTaperSprite;
+  if (!arcTaperSprite) arcTaperSprite = document.createElement("canvas");
+  arcTaperSprite.width = W;
+  arcTaperSprite.height = H;
+  const gctx = arcTaperSprite.getContext("2d");
+  gctx.save();
+  gctx.translate(cx, originY);
+  gctx.rotate(tilt);
+  const steps = 110;
+  for (let i = 0; i < steps; i++){
+    const u0 = i / steps, u1 = (i + 1) / steps;
+    const umid = (u0 + u1) / 2;
+    const edgeness = Math.pow(Math.abs(umid - 0.5) * 2, 1.6);
+    const w = baseWidth + (endWidth - baseWidth) * edgeness;
+    const tA = a1 + (a2 - a1) * u0, tB = a1 + (a2 - a1) * u1;
+    const segAlpha = alphaMult * (0.55 + edgeness * 0.4);
+    // u=0 sits at a1 (the left end, cyan) through u=1 at a2 (right, magenta)
+    // — a straight per-segment lerp between the two end colors, cheap and
+    // smooth since each segment is tiny, no gradient object needed per call
+    const r = Math.round(20 + (205 - 20) * umid);
+    const g = Math.round(160 + (90 - 160) * umid);
+    const b = Math.round(225 + (255 - 225) * umid);
+    gctx.beginPath();
+    gctx.moveTo(Math.cos(tA) * rx, Math.sin(tA) * ry);
+    gctx.lineTo(Math.cos(tB) * rx, Math.sin(tB) * ry);
+    gctx.strokeStyle = `rgba(${r},${g},${b},${segAlpha})`;
+    gctx.lineWidth = w;
+    gctx.shadowColor = "#a070ff";
+    gctx.shadowBlur = blur * (0.7 + edgeness * 0.6);
+    gctx.stroke();
+  }
+  gctx.restore();
+  arcTaperSpriteKey = key;
+  return arcTaperSprite;
+}
+
+/* One open arc line, reused for the main arc, the always-on secondary,
+   and the thinking/speaking echo — same shape family as drawRing's
+   three-tier system on the Orbit face, just built on an open sweep
+   instead of a closed loop. */
+function drawOpenArc(opts){
+  const { rxMult, tiltOffset, dipOffset, active, alphaMult, baseWidth, endWidth, blur, taper } = opts;
+  // R*7 looks right at normal aspect ratios, but on a much wider window
+  // the ellipse itself has to grow too, not just the angle searched —
+  // its reach tops out at rx no matter the angle, so rx has to stay
+  // comfortably past however far the edge search will need to go
+  const target = W / 2 + R * 1.5;
+  const rx = Math.max(R * 7, target * 1.3) * rxMult, ry = rx * 0.5;
+  const tilt = -0.08 + tiltOffset;
+  const dipBottomY = cy + R * (0.08 + dipOffset);
+  const originY = dipBottomY - ry;
+  const { a1, a2 } = edgeAngles(rx, ry, tilt);
+
+  if (taper){
+    // the sprite is pre-baked in full-canvas coordinates (its own build
+    // already applied this same translate/rotate), so it's stamped back
+    // directly, no transform wrapper here
+    const sprite = getArcTaperSprite(a1, a2, rx, ry, tilt, originY, baseWidth, endWidth, blur, alphaMult);
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+    ctx.drawImage(sprite, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.restore();
+  } else {
+    ctx.save();
+    ctx.translate(cx, originY);
+    ctx.rotate(tilt);
+    ctx.beginPath();
+    const segs = 140;
+    for (let i = 0; i <= segs; i++){
+      const t = a1 + (a2 - a1) * (i / segs);
+      const px = Math.cos(t) * rx, py = Math.sin(t) * ry;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    const grad = ctx.createLinearGradient(-rx, 0, rx, 0);
+    grad.addColorStop(0, `rgba(20,160,225,${alphaMult})`);
+    grad.addColorStop(0.5, `rgba(220,225,255,${alphaMult * 0.85})`);
+    grad.addColorStop(1, `rgba(205,90,255,${alphaMult})`);
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = baseWidth;
+    ctx.shadowColor = "#a070ff";
+    ctx.shadowBlur = blur;
+    ctx.stroke();
+    ctx.restore();
+  }
+  return { rx, ry, tilt, originY, a1, a2 };
+}
+
+function drawArc(state, shimmerPhase, secondaryPhase, workFade){
+  const active = ARC_ACTIVE[state] ?? 0;
+  const alpha = 0.65 + active * 0.3;
+
+  // the always-on secondary, a quiet companion riding visibly outside
+  // the main line with its own slow independent wobble — same
+  // relationship the Orbit face's secondary ring has to its own main
+  // ring, pulled further out and brighter than the first pass so it
+  // actually reads as its own separate line, not a blur on the main one
+  const secTilt = Math.sin(secondaryPhase) * 0.025;
+  drawOpenArc({
+    rxMult: 1.07, tiltOffset: secTilt, dipOffset: 0.05, active,
+    alphaMult: 0.4 + active * 0.12, baseWidth: 2.4, endWidth: 2.4, blur: 12, taper: false,
+  });
+
+  // the echo, present only while thinking/speaking, eased in and out,
+  // a beat behind the secondary's own wobble — same shadowed-timing
+  // relationship as the Orbit face's echo ring. Pulled out meaningfully
+  // further than the secondary and given its own faster, wider wobble
+  // so it reads as genuinely more alive, not just a dimmer copy riding
+  // the same motion.
+  if (workFade > 0.01){
+    const echoPhase = secondaryPhase * 1.8 - 1.1;
+    const echoTilt = Math.sin(echoPhase) * 0.045;
+    drawOpenArc({
+      rxMult: 1.26, tiltOffset: echoTilt, dipOffset: 0.16, active,
+      alphaMult: (0.36 + active * 0.12) * workFade, baseWidth: 2.1, endWidth: 2.1, blur: 11, taper: false,
+    });
+  }
+
+  // the main line — tapered thick at the two visible ends, narrower
+  // through the middle, with the shimmer and the coil riding on top
+  const geo = drawOpenArc({
+    rxMult: 1, tiltOffset: 0, dipOffset: 0, active,
+    alphaMult: alpha, baseWidth: 7 + active * 4, endWidth: 20 + active * 10, blur: 28 + active * 18, taper: true,
+  });
+
+  ctx.save();
+  ctx.translate(cx, geo.originY);
+  ctx.rotate(geo.tilt);
+  // a slow bright shimmer traveling the length of the arc
+  const core = ctx.createLinearGradient(-geo.rx, 0, geo.rx, 0);
+  const sp = (Math.sin(shimmerPhase) + 1) / 2;
+  core.addColorStop(Math.max(0, sp - 0.18), "rgba(255,255,255,0)");
+  core.addColorStop(sp, `rgba(255,255,255,${0.5 + active * 0.4})`);
+  core.addColorStop(Math.min(1, sp + 0.18), "rgba(255,255,255,0)");
+  ctx.strokeStyle = core;
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#ffffff";
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  const segs = 140;
+  for (let i = 0; i <= segs; i++){
+    const t = geo.a1 + (geo.a2 - geo.a1) * (i / segs);
+    const px = Math.cos(t) * geo.rx, py = Math.sin(t) * geo.ry;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  // the coiling thread, same technique as the Orbit face's ring: a wire
+  // that visibly wraps the arc's own tube as it travels. Only on the
+  // main line, and — matching the Orbit face exactly — only while
+  // thinking or speaking, eased in and out with the same workFade as
+  // the echo line rather than always present.
+  if (workFade > 0.01){
+    drawArcCoil(geo.a1, geo.a2, geo.rx, geo.ry, geo.tilt, geo.originY, alpha * workFade, shimmerPhase * 1.4);
+  }
+}
+
+function drawArcCoil(a1, a2, rx, ry, tilt, originY, alpha, phase){
+  const wraps = 50, amp = R * 0.035;
+  ctx.save();
+  ctx.translate(cx, originY);
+  ctx.rotate(tilt);
+  ctx.globalCompositeOperation = "screen";
+
+  const span = Math.abs(a1 - a2);
+  // a real width change per segment reads as the wire physically turning
+  // toward and away from the viewer as it wraps — thicker where the
+  // same sine that displaces it sideways peaks positive, thinner where
+  // it troughs negative, same phase driving both. No shadowBlur per
+  // segment (that's the expensive part, same lesson as the Orbit ring
+  // pulse trails) — one single soft glow pass underneath instead.
+  const segs = Math.max(260, Math.round(wraps * 22 * (span / 6.2832)));
+
+  ctx.shadowBlur = 0;
+  for (let i = 0; i < segs; i++){
+    const t0 = a1 + (a2 - a1) * (i / segs);
+    const t1 = a1 + (a2 - a1) * ((i + 1) / segs);
+    const w0 = segPoint(t0, rx, ry), w1 = segPoint(t1, rx, ry);
+    const wob0 = Math.sin(t0 * wraps + phase), wob1 = Math.sin(t1 * wraps + phase);
+    const p0 = offsetPoint(w0, wob0 * amp), p1 = offsetPoint(w1, wob1 * amp);
+    const lw = 0.6 + ((wob0 + wob1) / 2 + 1) / 2 * 1.5;
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y);
+    ctx.strokeStyle = `rgba(225,235,255,${alpha * 0.85})`;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  // one soft full-length glow pass underneath the sharp wire, the only
+  // shadowed stroke this whole coil costs
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++){
+    const t = a1 + (a2 - a1) * (i / segs);
+    const wob = Math.sin(t * wraps + phase);
+    const p = offsetPoint(segPoint(t, rx, ry), wob * amp);
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = `rgba(190,215,255,${alpha * 0.35})`;
+  ctx.lineWidth = 1.4;
+  ctx.shadowColor = "#bfe4ff";
+  ctx.shadowBlur = 9;
+  ctx.stroke();
+
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+}
+function segPoint(t, rx, ry){
+  return { x: Math.cos(t) * rx, y: Math.sin(t) * ry, nx: -Math.sin(t) * rx, ny: Math.cos(t) * ry };
+}
+function offsetPoint(pt, wobble){
+  const tl = Math.hypot(pt.nx, pt.ny) || 1;
+  const nx = -pt.ny / tl, ny = pt.nx / tl;
+  return { x: pt.x + nx * wobble, y: pt.y + ny * wobble };
+}
+
+/* a soft, wide, flat glow on a floor plane far below the orb — fixed in
+   place on its own Y position (R, the orb's non-breathing base radius,
+   never orbR), so it reads as a distant ground the orb's light reaches
+   down to, not a shadow stuck to the orb's own surface. Only its
+   brightness responds to state/env, as if the orb were shining harder
+   onto that same fixed floor, never its position. */
+function drawGroundGlow(state, env){
+  const active = ARC_ACTIVE[state] ?? 0;
+  const gy = cy + R * 2.7;
+  const gw = R * 4.4, gh = R * 0.42;
+  const a = (0.3 + active * 0.3 + (state === "speaking" ? env * 0.25 : 0)) * 0.5;
+
+  // spread over a much larger radius than the bright core actually
+  // needs, with several gradual stops instead of one sharp jump — the
+  // fade needs room to dissipate, a tight radius reads as a defined
+  // oval shape no matter how many stops sit inside it
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  ctx.translate(cx, gy);
+  ctx.scale(1, gh / gw);
+  const spread = gw * 2.2;
+  const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, spread);
+  glow.addColorStop(0, `rgba(190,210,255,${a})`);
+  glow.addColorStop(0.15, `rgba(175,198,255,${a * 0.72})`);
+  glow.addColorStop(0.35, `rgba(155,182,255,${a * 0.4})`);
+  glow.addColorStop(0.6, `rgba(145,172,255,${a * 0.16})`);
+  glow.addColorStop(0.82, `rgba(140,170,255,${a * 0.04})`);
+  glow.addColorStop(1, "rgba(140,170,255,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(0, 0, spread, 0, 6.2832); ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+}
+
+function frame(dt){
+  AV.tick(dt);
+  clock += dt / 1000;
+  const state = AV.state;
+  const env = AV.env || 0;
+  const samples = AV.samples;
+
+  shimmerPhase += (state === "speaking" ? 1.6 : state === "thinking" ? 1.0 : 0.5) * (dt / 1000);
+  secondaryPhase += 0.12 * (dt / 1000);
+  const wantWork = (state === "thinking" || state === "speaking");
+  workFade += ((wantWork ? 1 : 0) - workFade) * Math.min(1, (dt / 1000) * 2.2);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(getBackgroundSprite(clock), 0, 0);
+  drawArc(state, shimmerPhase, secondaryPhase, workFade);
+
+  const breathe = state === "speaking"
+    ? 1 + env * 0.16
+    : 1 + Math.sin(clock * (BREATHE_HZ[state] ?? 0.35) * 6.2832) * (BREATHE_AMT[state] ?? 0.03);
+  const orbR = R * breathe;
+
+  drawGroundGlow(state, env);
+  drawOrb(orbR, state, env);
+  drawStatusPill(state, samples);
+
+  requestAnimationFrame(() => frame(1000 / 60));
+}
+
+function drawOrb(orbR, state, env){
+  ctx.save();
+  // same lesson as the ground glow: a two-stop gradient crammed into a
+  // tight radius reads as a defined ring no matter how low the alpha
+  // is. Spread over a much bigger radius with several gradual stops so
+  // it genuinely dissolves instead of visibly ending.
+  const glowR = orbR * (3.2 + env * 0.5);
+  const glow = ctx.createRadialGradient(cx, cy, orbR * 1.04, cx, cy, glowR);
+  const glowA = state === "idle" ? 0.05 : state === "listening" ? 0.07 : state === "thinking" ? 0.08 : 0.1 + env * 0.09;
+  glow.addColorStop(0, `rgba(140,170,255,${glowA})`);
+  glow.addColorStop(0.18, `rgba(140,170,255,${glowA * 0.7})`);
+  glow.addColorStop(0.4, `rgba(140,170,255,${glowA * 0.38})`);
+  glow.addColorStop(0.65, `rgba(140,170,255,${glowA * 0.15})`);
+  glow.addColorStop(0.86, `rgba(140,170,255,${glowA * 0.04})`);
+  glow.addColorStop(1, "rgba(140,170,255,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(cx, cy, glowR, 0, 6.2832); ctx.fill();
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.clip();
+  if (orbitRefReady){
+    const d = orbR * 2.02;
+    ctx.drawImage(
+      orbitRef, ORBIT_REF_SRC.sx, ORBIT_REF_SRC.sy, ORBIT_REF_SRC.sw, ORBIT_REF_SRC.sh,
+      cx - d / 2, cy - d / 2, d, d
+    );
+  } else {
+    ctx.fillStyle = "#d7d9ea";
+    ctx.fillRect(cx - orbR, cy - orbR, orbR * 2, orbR * 2);
+  }
+
+  const exposure = state === "speaking" ? 0.1 + env * 0.3
+    : state === "thinking" ? 0.16
+    : state === "listening" ? 0.08
+    : 0.04 + Math.sin(clock * 0.9) * 0.02;
+  if (exposure > 0.01){
+    ctx.globalCompositeOperation = "screen";
+    const exp = ctx.createRadialGradient(
+      cx - orbR * 0.15, cy - orbR * 0.15, 0,
+      cx, cy, orbR * 1.05
+    );
+    exp.addColorStop(0, `rgba(255,255,255,${exposure})`);
+    exp.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = exp;
+    ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawStatusPill(state, samples){
+  const label = { idle: "Idle", listening: "Listening...", thinking: "Thinking...", speaking: "Speaking..." }[state] || "Idle";
+  const on = state !== "idle";
+  const pillW = Math.min(520, W * 0.42), pillH = 44;
+  const px = cx - pillW / 2, py = H - Math.max(48, H * 0.09) - pillH / 2;
+
+  ctx.save();
+  roundRectPath(ctx, px, py, pillW, pillH, pillH / 2);
+  ctx.fillStyle = "rgba(15,18,38,0.68)";
+  ctx.fill();
+  ctx.strokeStyle = `rgba(138,107,255,${on ? 0.4 : 0.22})`;
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#8a6bff";
+  ctx.shadowBlur = on ? 12 : 4;
+  ctx.stroke();
+  ctx.restore();
+
+  const midY = py + pillH / 2;
+
+  const dotGrad = ctx.createLinearGradient(px + 20, midY, px + 28, midY);
+  dotGrad.addColorStop(0, "#4fc3ff");
+  dotGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = dotGrad;
+  ctx.globalAlpha = on ? 0.95 : 0.55;
+  ctx.beginPath(); ctx.arc(px + 24, midY, 3, 0, 6.2832); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // "<NAME> ACTIVE" on the left, state label on the right, waveform
+  // filling whatever real space is left between them — measured off the
+  // actual rendered text each frame, not a fixed fraction of the pill.
+  // The old fixed cx-centered band only worked for one specific name
+  // length; "MERIDIAN ACTIVE" alone is long enough at this font size to
+  // run straight into it, which is exactly the overlap this fixes — and
+  // it now holds for any name someone picks, not just this one.
+  ctx.textAlign = "left";
+  ctx.font = "500 12px -apple-system, 'SF Pro Display', sans-serif";
+  ctx.letterSpacing = "2px";
+  const nameText = (AV.name || "MERIDIAN").toUpperCase() + " ACTIVE";
+  const nameX = px + 40;
+  ctx.fillStyle = "rgba(230,238,250,0.9)";
+  ctx.fillText(nameText, nameX, midY + 4);
+  const nameWidth = ctx.measureText(nameText).width;
+  ctx.letterSpacing = "0px";
+
+  ctx.textAlign = "right";
+  ctx.font = "400 12px -apple-system, 'SF Pro Display', sans-serif";
+  const labelWidth = ctx.measureText(label).width;
+
+  const barsGap = 16;
+  const barsX0 = nameX + nameWidth + barsGap;
+  const barsX1 = (px + pillW - 24) - labelWidth - barsGap;
+  const barsN = 40, barW = Math.max(0, (barsX1 - barsX0) / barsN);
+  const barGrad = ctx.createLinearGradient(barsX0, 0, barsX0 + barsN * barW, 0);
+  barGrad.addColorStop(0, "#4fc3ff");
+  barGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = barGrad;
+  for (let i = 0; i < barsN; i++){
+    const s = samples[Math.floor(i * 64 / barsN)] || 0;
+    const amp = state === "speaking" ? s
+      : state === "listening" ? 0.06 + 0.04 * Math.abs(Math.sin(i * 0.7 + clock * 3))
+      : 0.04 + 0.02 * Math.sin(i * 0.5 + clock * 1.2);
+    const barH = Math.max(1.5, amp * 20);
+    ctx.globalAlpha = on ? 0.4 + 0.55 * amp : 0.22;
+    ctx.fillRect(barsX0 + i * barW, midY - barH / 2, barW * 0.5, barH);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.textAlign = "right";
+  ctx.letterSpacing = "0.6px";
+  ctx.fillStyle = on ? "rgba(150,200,240,0.85)" : "rgba(140,155,180,0.6)";
+  ctx.fillText(label, px + pillW - 24, midY + 4);
+  ctx.letterSpacing = "0px";
+}
+
+requestAnimationFrame(() => frame(16.6));
+</script>
+</body>
+</html>

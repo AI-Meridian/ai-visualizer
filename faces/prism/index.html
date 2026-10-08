@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Meridian</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#080b1a;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  /* real <img>, not canvas-drawn — the canvas backing store is capped to
+     1x device pixels for performance (see resize() below), which blurs
+     anything crisp drawn into it on a retina screen. A native <img>
+     renders through the browser's own compositor at full display
+     resolution regardless, same fix core.js already uses for the task
+     panel's text. */
+  #logo-wrap{position:fixed;left:28px;top:28px;width:44px;height:40px;overflow:hidden;z-index:40;pointer-events:none}
+  #logo-wrap img{display:block;height:40px;width:auto}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="logo-wrap"><img src="assets/meridian-mark.png" alt=""></div>
+<script src="../../core.js"></script>
+<script>
+/* ============================================================
+   Prism face: the brand orb sitting at the crossing of two wide
+   light-beam planes forming an X — cyan from one corner, violet
+   from the other, each narrow right behind the orb and flaring
+   wide at the frame edges. Same house principles as every other
+   Meridian face: a tapered main element cached to an offscreen
+   sprite (the expensive shadowed part, baked once per state/resize
+   instead of per frame), an always-on dimmer secondary companion
+   with its own slow wobble, a workFade-gated echo band that only
+   shows up while thinking/speaking, and a coiling thread riding
+   the main beams during that same window — built as one continuous
+   path per beam, not per-segment shadowBlur, to stay cheap.
+   ============================================================ */
+"use strict";
+// Meridian's own activation chime, not Jared's generic thinking.wav.
+// core.js (one of the four unmodified upstream components) always loads
+// its own shared assets/thinking.wav with no override hook exposed, and
+// it's not this project's file to edit — so the swap happens here, at
+// the face level, via a temporary Audio() patch active only for the
+// single synchronous instant core.js's own soundInit() constructs its
+// player (inside AV.init, called synchronously below, nothing async
+// in between). Restored immediately after, so nothing else is affected.
+(() => {
+  const RealAudio = window.Audio;
+  window.Audio = function (src) {
+    const a = new RealAudio(
+      src && String(src).includes("thinking.wav") ? "assets/activate-chime.wav" : src
+    );
+    // Preview-only: the demo script's own "thinking" phase (core.js,
+    // 4.2s) is shorter than this chime (~11s), so core.js's stopSound()
+    // would cut it short. Just no-op'ing pause() wasn't enough — that
+    // function also sets currentTime = 0 right after pause(), which
+    // still rewound the still-running clip back to the start, sounding
+    // like a restart rather than one clean play-through. Swallow
+    // exactly that one paired reset (and only that one) so the
+    // legitimate "start fresh" reset before each real play() call still
+    // works normally on every later cycle. AV.demo is never true in a
+    // real install, so production behavior (cut off when thinking
+    // actually ends) is untouched.
+    if (AV.demo) {
+      let swallowNextSeek = false;
+      a.pause = () => { swallowNextSeek = true; };
+      const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime");
+      Object.defineProperty(a, "currentTime", {
+        get() { return desc.get.call(a); },
+        set(v) {
+          if (swallowNextSeek) { swallowNextSeek = false; return; }
+          desc.set.call(a, v);
+        }
+      });
+    }
+    return a;
+  };
+  AV.init({});
+  window.Audio = RealAudio;
+})();
+AV.ready(a => { document.title = a.name || "Meridian"; });
+
+if (AV.demo && !new URLSearchParams(location.search).get("name")){
+  AV.name = "Meridian";
+  AV.label = "M.E.R.I.D.I.A.N.";
+}
+
+(() => {
+  const s = document.createElement("style");
+  s.textContent = `
+    #av-task-panel{
+      background: rgba(20,28,56,0.72);
+      border: 1px solid rgba(138,107,255,0.35);
+      border-radius: 16px;
+      box-shadow: 0 1px 0 rgba(255,255,255,.14) inset, 0 8px 24px rgba(79,195,255,.15), 0 0 22px rgba(138,107,255,.14);
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      font-family: -apple-system, "SF Pro Display", sans-serif;
+    }
+    #av-task-panel .av-task-head{ color: rgba(191,228,255,0.9); }
+    #av-task-panel .av-task-dot{ background: linear-gradient(90deg,#4fc3ff,#8a6bff); }
+    #av-task-panel .av-task-label{ color: rgba(236,242,250,0.95); }
+    #av-task-panel .av-task-bars i{ background: linear-gradient(180deg,#4fc3ff,#8a6bff); }
+  `;
+  document.head.appendChild(s);
+})();
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1, cx = 0, cy = 0, R = 0;
+
+const orbitRef = new Image();
+let orbitRefReady = false;
+orbitRef.onload = () => { orbitRefReady = true; };
+orbitRef.src = "assets/orbit-reference.png";
+const ORBIT_REF_SRC = { sx: 140, sy: 137, sw: 980, sh: 980 };
+
+function resize(){
+  // capped at 1x, not 2x — the background/beam gradients this face
+  // repaints are the real cost, and halving the pixel count per axis on a
+  // retina display cuts that by ~4x, the single biggest lever for
+  // low-power machines
+  DPR = Math.min(1, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W / 2; cy = H * 0.44;
+  R = Math.min(H, W) * 0.135;
+}
+addEventListener("resize", resize);
+resize();
+
+function roundRectPath(g, x, y, w, h, r){
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+const BREATHE_AMT  = { idle: 0.03, listening: 0.045, thinking: 0.03, speaking: 0.0 };
+const BREATHE_HZ   = { idle: 0.35, listening: 0.55, thinking: 0.9,  speaking: 0 };
+const BEAM_ACTIVE  = { idle: 0, listening: 0.15, thinking: 0.55, speaking: 0.9 };
+
+// the two crossing beams — cyan one running top-left/bottom-right, violet
+// one running top-right/bottom-left, matching the reference render. Tilts
+// measured off the actual reference image, not guessed.
+const BEAM_A_TILT = 0.40;
+const BEAM_B_TILT = -0.40;
+const BEAM_A_RGB = [70, 165, 255];
+const BEAM_B_RGB = [150, 100, 235];
+const BEAM_PALE_RGB = [220, 230, 255];
+
+let clock = 0;
+let secondaryPhase = 0;
+let shimmerPhase = 0;
+let coilPhase = 0;
+let workFade = 0;
+
+function drawBackground(gctx, clock){
+  gctx.shadowBlur = 0;
+  gctx.fillStyle = "#05060f";
+  gctx.fillRect(0, 0, W, H);
+
+  const driftB = Math.sin(clock * 0.05) * 0.035;
+  const blueX = W * (0.32 + driftB), blueY = H * (0.14 - driftB * 0.6);
+  const blueA = 0.85 + Math.sin(clock * 0.045) * 0.15;
+  const blue = gctx.createRadialGradient(blueX, blueY, 0, blueX, blueY, Math.max(W, H) * 0.62);
+  blue.addColorStop(0, `rgba(20,55,150,${0.68 * blueA})`);
+  blue.addColorStop(0.55, `rgba(12,32,100,${0.36 * blueA})`);
+  blue.addColorStop(1, "rgba(12,32,100,0)");
+  gctx.fillStyle = blue;
+  gctx.fillRect(0, 0, W, H);
+
+  const driftP = Math.sin(clock * 0.038 + 2.1) * 0.035;
+  const purpX = W * (0.78 + driftP), purpY = H * (0.78 - driftP * 0.5);
+  const purpA = 0.85 + Math.sin(clock * 0.052 + 1.4) * 0.15;
+  const purple = gctx.createRadialGradient(purpX, purpY, 0, purpX, purpY, Math.max(W, H) * 0.58);
+  purple.addColorStop(0, `rgba(85,20,165,${0.42 * purpA})`);
+  purple.addColorStop(0.55, `rgba(42,14,95,${0.22 * purpA})`);
+  purple.addColorStop(1, "rgba(42,14,95,0)");
+  gctx.fillStyle = purple;
+  gctx.fillRect(0, 0, W, H);
+}
+
+// Every drift term above is sub-0.1Hz — nothing in this background moves
+// fast enough for the eye to tell 10 repaints/sec from 60. Baked to an
+// offscreen sprite and only repainted on that slower clock, same
+// sprite-cache lesson as the beam sprite below, just keyed on elapsed
+// time instead of a fixed parameter tuple since this one drifts
+// continuously rather than switching between discrete states.
+let bgSprite = null, bgSpriteW = 0, bgSpriteH = 0, bgSpriteClock = -999;
+const BG_REFRESH_SEC = 1 / 10;
+function getBackgroundSprite(clock){
+  if (!bgSprite) bgSprite = document.createElement("canvas");
+  const resized = bgSpriteW !== W || bgSpriteH !== H;
+  if (resized || clock - bgSpriteClock >= BG_REFRESH_SEC){
+    bgSprite.width = W; bgSprite.height = H;
+    drawBackground(bgSprite.getContext("2d"), clock);
+    bgSpriteW = W; bgSpriteH = H; bgSpriteClock = clock;
+  }
+  return bgSprite;
+}
+
+// how far a beam has to reach from the crossing point to clear the frame
+// at any aspect ratio — half the diagonal plus a margin, so widening the
+// browser never runs the beam out before it reaches the edge
+function beamReach(){
+  return Math.hypot(W, H) * 0.8 + R * 2;
+}
+
+/* The tapered beam itself — narrow and near-white right where it passes
+   behind the orb, widening and saturating toward its own hue as it flares
+   out to the frame edges. Built the same way the Default face's arc taper
+   is: many short straight segments with continuously varying width/alpha,
+   not a handful of discrete bands. That's real cost if paid every frame
+   (each segment is a shadowed stroke), so — same fix as every other face's
+   expensive glow — it's rendered once onto an offscreen sprite, keyed on
+   its own parameters, and just stamped back with drawImage until the
+   window resizes or the state-driven width/blur actually changes. */
+function drawBeamInto(gctx, tilt, rgb, baseWidth, endWidth, blur, alphaMult, reach){
+  const dirX = Math.cos(tilt), dirY = Math.sin(tilt);
+  const steps = 130;
+  for (let i = 0; i < steps; i++){
+    const u0 = i / steps, u1 = (i + 1) / steps;
+    const umid = (u0 + u1) / 2;
+    const t0 = u0 * 2 - 1, t1 = u1 * 2 - 1, tmid = umid * 2 - 1;
+    const edge = Math.pow(Math.abs(tmid), 1.6);
+    const w = baseWidth + (endWidth - baseWidth) * edge;
+    const d0 = t0 * reach, d1 = t1 * reach;
+    const paleMix = Math.max(0, 1 - Math.abs(tmid) * 2.1);
+    const r = Math.round(rgb[0] + (BEAM_PALE_RGB[0] - rgb[0]) * paleMix);
+    const g = Math.round(rgb[1] + (BEAM_PALE_RGB[1] - rgb[1]) * paleMix);
+    const b = Math.round(rgb[2] + (BEAM_PALE_RGB[2] - rgb[2]) * paleMix);
+    const segAlpha = alphaMult * (0.55 + edge * 0.4);
+    gctx.beginPath();
+    gctx.moveTo(dirX * d0, dirY * d0);
+    gctx.lineTo(dirX * d1, dirY * d1);
+    gctx.strokeStyle = `rgba(${r},${g},${b},${segAlpha})`;
+    gctx.lineWidth = w;
+    gctx.shadowColor = `rgb(${rgb.join(",")})`;
+    gctx.shadowBlur = blur * (0.7 + edge * 0.6);
+    gctx.stroke();
+  }
+}
+
+let beamSprite = null, beamSpriteKey = "";
+function getBeamSprite(state){
+  const active = BEAM_ACTIVE[state] ?? 0;
+  const key = `${W}x${H}|${state}`;
+  if (beamSprite && beamSpriteKey === key) return beamSprite;
+  if (!beamSprite) beamSprite = document.createElement("canvas");
+  beamSprite.width = W; beamSprite.height = H;
+  const gctx = beamSprite.getContext("2d");
+  gctx.translate(cx, cy);
+  const reach = beamReach();
+  const baseWidth = 3 + active * 2, endWidth = 90 + active * 40, blur = 30 + active * 22;
+  const alpha = 0.6 + active * 0.3;
+  drawBeamInto(gctx, BEAM_A_TILT, BEAM_A_RGB, baseWidth, endWidth, blur, alpha, reach);
+  drawBeamInto(gctx, BEAM_B_TILT, BEAM_B_RGB, baseWidth, endWidth, blur, alpha, reach);
+  beamSpriteKey = key;
+  return beamSprite;
+}
+
+/* A single cheap straight-line companion, no taper sprite needed — just
+   a thin two-stop gradient stroke, one shadowed pass. Used for both the
+   always-on secondary (dimmer, slow independent wobble) and the
+   workFade-gated echo (further out, faster wobble, only while
+   thinking/speaking) — the same "extra little bands that animate with
+   it" pattern every other Meridian face uses for its own activity-only
+   element. */
+function drawBeamLine(tilt, rgb, width, blur, alphaMult, reach){
+  const dirX = Math.cos(tilt), dirY = Math.sin(tilt);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.beginPath();
+  ctx.moveTo(-dirX * reach, -dirY * reach);
+  ctx.lineTo(dirX * reach, dirY * reach);
+  const grad = ctx.createLinearGradient(-dirX * reach, -dirY * reach, dirX * reach, dirY * reach);
+  grad.addColorStop(0, `rgba(${rgb.join(",")},${alphaMult})`);
+  grad.addColorStop(0.5, `rgba(${BEAM_PALE_RGB.join(",")},${alphaMult * 0.85})`);
+  grad.addColorStop(1, `rgba(${rgb.join(",")},${alphaMult})`);
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = width;
+  ctx.shadowColor = `rgb(${rgb.join(",")})`;
+  ctx.shadowBlur = blur;
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* The coiling thread, riding one of the main beams — same technique as
+   every other face: perpendicular sine displacement along the beam's own
+   (constant, since it's a straight line) normal direction, walked as one
+   continuous path so it's a single stroke call rather than hundreds of
+   per-segment shadowed ones. Only visible while thinking/speaking. */
+function drawBeamCoil(tilt, alpha, phase, reach){
+  const dirX = Math.cos(tilt), dirY = Math.sin(tilt);
+  const nx = -dirY, ny = dirX;
+  const wraps = 26, amp = R * 0.05;
+  const segs = 420;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.globalCompositeOperation = "screen";
+  ctx.shadowBlur = 0;
+
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++){
+    const t = (i / segs) * 2 - 1;
+    const d = t * reach;
+    const wob = Math.sin(t * wraps * Math.PI + phase) * amp;
+    const px = dirX * d + nx * wob, py = dirY * d + ny * wob;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.strokeStyle = `rgba(225,235,255,${alpha * 0.85})`;
+  ctx.lineWidth = 1.1;
+  ctx.stroke();
+
+  // one soft glow pass underneath, the only shadowed stroke this coil costs
+  ctx.strokeStyle = `rgba(190,215,255,${alpha * 0.32})`;
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = "#bfe4ff";
+  ctx.shadowBlur = 9;
+  ctx.stroke();
+
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+}
+
+/* A slow bright highlight traveling the length of each main beam — the
+   same "shimmer" the Default face's arc has, translated onto a straight
+   line. Cheap: one gradient stroke per beam, no shadowBlur. */
+function drawBeamShimmer(tilt, phase, active, reach){
+  const dirX = Math.cos(tilt), dirY = Math.sin(tilt);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.beginPath();
+  ctx.moveTo(-dirX * reach, -dirY * reach);
+  ctx.lineTo(dirX * reach, dirY * reach);
+  const grad = ctx.createLinearGradient(-dirX * reach, -dirY * reach, dirX * reach, dirY * reach);
+  const sp = (Math.sin(phase) + 1) / 2;
+  grad.addColorStop(Math.max(0, sp - 0.14), "rgba(255,255,255,0)");
+  grad.addColorStop(sp, `rgba(255,255,255,${0.45 + active * 0.35})`);
+  grad.addColorStop(Math.min(1, sp + 0.14), "rgba(255,255,255,0)");
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = 1;
+  ctx.restore();
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.beginPath();
+  ctx.moveTo(-dirX * reach, -dirY * reach);
+  ctx.lineTo(dirX * reach, dirY * reach);
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#ffffff";
+  ctx.shadowBlur = 7;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBeams(state, secondaryPhase, shimmerPhase, coilPhase, workFade){
+  const active = BEAM_ACTIVE[state] ?? 0;
+  const reach = beamReach();
+
+  // the always-on secondary companion for each beam — dimmer, thinner,
+  // its own slow independent wobble so it doesn't just mechanically
+  // trail the main beam
+  const secTiltA = BEAM_A_TILT + Math.sin(secondaryPhase) * 0.025;
+  const secTiltB = BEAM_B_TILT + Math.sin(secondaryPhase * 0.85 + 1.7) * 0.025;
+  drawBeamLine(secTiltA, BEAM_A_RGB, 2.2, 11, 0.3 + active * 0.1, reach);
+  drawBeamLine(secTiltB, BEAM_B_RGB, 2.2, 11, 0.3 + active * 0.1, reach);
+
+  // the echo — present only while thinking/speaking, a faster, wider
+  // wobble, fading in and out with workFade, same relationship every
+  // other face's echo element has to its own secondary
+  if (workFade > 0.01){
+    const echoTiltA = BEAM_A_TILT + Math.sin(secondaryPhase * 1.7 - 1.1) * 0.045;
+    const echoTiltB = BEAM_B_TILT + Math.sin(secondaryPhase * 1.7 + 0.6) * 0.045;
+    drawBeamLine(echoTiltA, BEAM_A_RGB, 2, 10, (0.3 + active * 0.1) * workFade, reach);
+    drawBeamLine(echoTiltB, BEAM_B_RGB, 2, 10, (0.3 + active * 0.1) * workFade, reach);
+  }
+
+  // the main beams — tapered thick and bright at the two visible ends,
+  // narrow and pale right behind the orb, pre-baked to a sprite
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  ctx.drawImage(getBeamSprite(state), 0, 0);
+  ctx.restore();
+
+  // the shimmer, traveling the length of each main beam
+  drawBeamShimmer(BEAM_A_TILT, shimmerPhase, active, reach);
+  drawBeamShimmer(BEAM_B_TILT, shimmerPhase * 0.92 + 2.4, active, reach);
+
+  // the coil, riding both main beams, only while thinking/speaking
+  if (workFade > 0.01){
+    drawBeamCoil(BEAM_A_TILT, workFade, coilPhase, reach);
+    drawBeamCoil(BEAM_B_TILT, workFade, coilPhase * 1.1 + 1.3, reach);
+  }
+}
+
+function frame(dt){
+  AV.tick(dt);
+  clock += dt / 1000;
+  const state = AV.state;
+  const env = AV.env || 0;
+  const samples = AV.samples;
+
+  secondaryPhase += 0.12 * (dt / 1000);
+  shimmerPhase += (state === "speaking" ? 1.6 : state === "thinking" ? 1.0 : 0.5) * (dt / 1000);
+  coilPhase += (state === "speaking" ? 2.4 : 1.7) * (dt / 1000);
+  const wantWork = (state === "thinking" || state === "speaking");
+  workFade += ((wantWork ? 1 : 0) - workFade) * Math.min(1, (dt / 1000) * 2.2);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(getBackgroundSprite(clock), 0, 0);
+  drawBeams(state, secondaryPhase, shimmerPhase, coilPhase, workFade);
+
+  const breathe = state === "speaking"
+    ? 1 + env * 0.16
+    : 1 + Math.sin(clock * (BREATHE_HZ[state] ?? 0.35) * 6.2832) * (BREATHE_AMT[state] ?? 0.03);
+  const orbR = R * breathe;
+
+  drawOrb(orbR, state, env);
+  drawStatusPill(state, samples);
+
+  requestAnimationFrame(() => frame(1000 / 60));
+}
+
+function drawOrb(orbR, state, env){
+  ctx.save();
+  const glowR = orbR * (3.2 + env * 0.5);
+  const glow = ctx.createRadialGradient(cx, cy, orbR * 1.04, cx, cy, glowR);
+  const glowA = state === "idle" ? 0.05 : state === "listening" ? 0.07 : state === "thinking" ? 0.08 : 0.1 + env * 0.09;
+  glow.addColorStop(0, `rgba(140,170,255,${glowA})`);
+  glow.addColorStop(0.18, `rgba(140,170,255,${glowA * 0.7})`);
+  glow.addColorStop(0.4, `rgba(140,170,255,${glowA * 0.38})`);
+  glow.addColorStop(0.65, `rgba(140,170,255,${glowA * 0.15})`);
+  glow.addColorStop(0.86, `rgba(140,170,255,${glowA * 0.04})`);
+  glow.addColorStop(1, "rgba(140,170,255,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(cx, cy, glowR, 0, 6.2832); ctx.fill();
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.clip();
+  if (orbitRefReady){
+    const d = orbR * 2.02;
+    ctx.drawImage(
+      orbitRef, ORBIT_REF_SRC.sx, ORBIT_REF_SRC.sy, ORBIT_REF_SRC.sw, ORBIT_REF_SRC.sh,
+      cx - d / 2, cy - d / 2, d, d
+    );
+  } else {
+    ctx.fillStyle = "#d7d9ea";
+    ctx.fillRect(cx - orbR, cy - orbR, orbR * 2, orbR * 2);
+  }
+
+  const exposure = state === "speaking" ? 0.1 + env * 0.3
+    : state === "thinking" ? 0.16
+    : state === "listening" ? 0.08
+    : 0.04 + Math.sin(clock * 0.9) * 0.02;
+  if (exposure > 0.01){
+    ctx.globalCompositeOperation = "screen";
+    const exp = ctx.createRadialGradient(
+      cx - orbR * 0.15, cy - orbR * 0.15, 0,
+      cx, cy, orbR * 1.05
+    );
+    exp.addColorStop(0, `rgba(255,255,255,${exposure})`);
+    exp.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = exp;
+    ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawStatusPill(state, samples){
+  const label = { idle: "Idle", listening: "Listening...", thinking: "Thinking...", speaking: "Speaking..." }[state] || "Idle";
+  const on = state !== "idle";
+  const pillW = Math.min(520, W * 0.42), pillH = 44;
+  const px = cx - pillW / 2, py = H - Math.max(48, H * 0.09) - pillH / 2;
+
+  ctx.save();
+  roundRectPath(ctx, px, py, pillW, pillH, pillH / 2);
+  ctx.fillStyle = "rgba(15,18,38,0.68)";
+  ctx.fill();
+  ctx.strokeStyle = `rgba(138,107,255,${on ? 0.4 : 0.22})`;
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#8a6bff";
+  ctx.shadowBlur = on ? 12 : 4;
+  ctx.stroke();
+  ctx.restore();
+
+  const midY = py + pillH / 2;
+
+  const dotGrad = ctx.createLinearGradient(px + 20, midY, px + 28, midY);
+  dotGrad.addColorStop(0, "#4fc3ff");
+  dotGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = dotGrad;
+  ctx.globalAlpha = on ? 0.95 : 0.55;
+  ctx.beginPath(); ctx.arc(px + 24, midY, 3, 0, 6.2832); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // "<NAME> ACTIVE" on the left, state label on the right, waveform
+  // filling whatever real space is left between them — measured off the
+  // actual rendered text each frame, not a fixed fraction of the pill.
+  // The old fixed cx-centered band only worked for one specific name
+  // length; "MERIDIAN ACTIVE" alone is long enough at this font size to
+  // run straight into it, which is exactly the overlap this fixes — and
+  // it now holds for any name someone picks, not just this one.
+  ctx.textAlign = "left";
+  ctx.font = "500 12px -apple-system, 'SF Pro Display', sans-serif";
+  ctx.letterSpacing = "2px";
+  const nameText = (AV.name || "MERIDIAN").toUpperCase() + " ACTIVE";
+  const nameX = px + 40;
+  ctx.fillStyle = "rgba(230,238,250,0.9)";
+  ctx.fillText(nameText, nameX, midY + 4);
+  const nameWidth = ctx.measureText(nameText).width;
+  ctx.letterSpacing = "0px";
+
+  ctx.textAlign = "right";
+  ctx.font = "400 12px -apple-system, 'SF Pro Display', sans-serif";
+  const labelWidth = ctx.measureText(label).width;
+
+  const barsGap = 16;
+  const barsX0 = nameX + nameWidth + barsGap;
+  const barsX1 = (px + pillW - 24) - labelWidth - barsGap;
+  const barsN = 40, barW = Math.max(0, (barsX1 - barsX0) / barsN);
+  const barGrad = ctx.createLinearGradient(barsX0, 0, barsX0 + barsN * barW, 0);
+  barGrad.addColorStop(0, "#4fc3ff");
+  barGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = barGrad;
+  for (let i = 0; i < barsN; i++){
+    const s = samples[Math.floor(i * 64 / barsN)] || 0;
+    const amp = state === "speaking" ? s
+      : state === "listening" ? 0.06 + 0.04 * Math.abs(Math.sin(i * 0.7 + clock * 3))
+      : 0.04 + 0.02 * Math.sin(i * 0.5 + clock * 1.2);
+    const barH = Math.max(1.5, amp * 20);
+    ctx.globalAlpha = on ? 0.4 + 0.55 * amp : 0.22;
+    ctx.fillRect(barsX0 + i * barW, midY - barH / 2, barW * 0.5, barH);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.textAlign = "right";
+  ctx.letterSpacing = "0.6px";
+  ctx.fillStyle = on ? "rgba(150,200,240,0.85)" : "rgba(140,155,180,0.6)";
+  ctx.fillText(label, px + pillW - 24, midY + 4);
+  ctx.letterSpacing = "0px";
+}
+
+requestAnimationFrame(() => frame(16.6));
+</script>
+</body>
+</html>

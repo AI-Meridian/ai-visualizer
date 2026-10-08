@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Meridian</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#080b1a;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  /* real <img>, not canvas-drawn — the canvas backing store is capped to
+     1x device pixels for performance (see resize() below), which blurs
+     anything crisp drawn into it on a retina screen. A native <img>
+     renders through the browser's own compositor at full display
+     resolution regardless, same fix core.js already uses for the task
+     panel's text. */
+  #logo-wrap{position:fixed;left:28px;top:28px;width:44px;height:40px;overflow:hidden;z-index:40;pointer-events:none}
+  #logo-wrap img{display:block;height:40px;width:auto}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="logo-wrap"><img src="assets/meridian-mark.png" alt=""></div>
+<script src="../../core.js"></script>
+<script>
+/* ============================================================
+   Meridian face: the brand orb (glossy pearl sphere, two slow
+   arcs of light) reacting to the shared voice-turn state.
+
+   No mic capture, no per-face HUD text for state — the bottom
+   pill (state label + real waveform, same language as the
+   "hugo" face) and core.js's own floating task panel (top
+   right, "WORKING" + whatever tool is running) are the two
+   status surfaces. This face just draws the orb.
+   ============================================================ */
+"use strict";
+// Meridian's own activation chime, not Jared's generic thinking.wav.
+// core.js (one of the four unmodified upstream components) always loads
+// its own shared assets/thinking.wav with no override hook exposed, and
+// it's not this project's file to edit — so the swap happens here, at
+// the face level, via a temporary Audio() patch active only for the
+// single synchronous instant core.js's own soundInit() constructs its
+// player (inside AV.init, called synchronously below, nothing async
+// in between). Restored immediately after, so nothing else is affected.
+(() => {
+  const RealAudio = window.Audio;
+  window.Audio = function (src) {
+    const a = new RealAudio(
+      src && String(src).includes("thinking.wav") ? "assets/activate-chime.wav" : src
+    );
+    // Preview-only: the demo script's own "thinking" phase (core.js,
+    // 4.2s) is shorter than this chime (~11s), so core.js's stopSound()
+    // would cut it short. Just no-op'ing pause() wasn't enough — that
+    // function also sets currentTime = 0 right after pause(), which
+    // still rewound the still-running clip back to the start, sounding
+    // like a restart rather than one clean play-through. Swallow
+    // exactly that one paired reset (and only that one) so the
+    // legitimate "start fresh" reset before each real play() call still
+    // works normally on every later cycle. AV.demo is never true in a
+    // real install, so production behavior (cut off when thinking
+    // actually ends) is untouched.
+    if (AV.demo) {
+      let swallowNextSeek = false;
+      a.pause = () => { swallowNextSeek = true; };
+      const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime");
+      Object.defineProperty(a, "currentTime", {
+        get() { return desc.get.call(a); },
+        set(v) {
+          if (swallowNextSeek) { swallowNextSeek = false; return; }
+          desc.set.call(a, v);
+        }
+      });
+    }
+    return a;
+  };
+  AV.init({});
+  window.Audio = RealAudio;
+})();
+AV.ready(a => { document.title = a.name || "Meridian"; });
+
+// This face is Meridian-branded specifically — unlike the generic faces
+// (board/radial/rain/neural), it shouldn't fall back to core.js's generic
+// "JARVIS" demo placeholder when no real config/name is supplied (e.g. this
+// file opened directly, with no ?name= param). A real live install always
+// supplies its own AV.name via /config and is left alone.
+if (AV.demo && !new URLSearchParams(location.search).get("name")){
+  AV.name = "Meridian";
+  AV.label = "M.E.R.I.D.I.A.N.";
+}
+
+// Re-theme the shared "current task" panel (core.js, top right) to the
+// Meridian brand palette. Appended AFTER AV.init() so it lands later in
+// the head than core.js's own injected <style> and wins the cascade —
+// core.js itself is untouched, so every other face keeps its own look.
+(() => {
+  const s = document.createElement("style");
+  s.textContent = `
+    #av-task-panel{
+      background: rgba(20,28,56,0.72);
+      border: 1px solid rgba(138,107,255,0.35);
+      border-radius: 16px;
+      box-shadow: 0 1px 0 rgba(255,255,255,.14) inset, 0 8px 24px rgba(79,195,255,.15), 0 0 22px rgba(138,107,255,.14);
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      font-family: -apple-system, "SF Pro Display", sans-serif;
+    }
+    #av-task-panel .av-task-head{ color: rgba(191,228,255,0.9); }
+    #av-task-panel .av-task-dot{ background: linear-gradient(90deg,#4fc3ff,#8a6bff); }
+    #av-task-panel .av-task-label{ color: rgba(236,242,250,0.95); }
+    #av-task-panel .av-task-bars i{ background: linear-gradient(180deg,#4fc3ff,#8a6bff); }
+  `;
+  document.head.appendChild(s);
+})();
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1, cx = 0, cy = 0, R = 0;
+
+// The orb itself, direct from the brand reference render rather than a
+// painted approximation of it — Seb's call: stop repainting the sphere's
+// material by hand and just use the actual image, then animate an
+// exposure/glow layer on top of it for state reactivity. Coordinates
+// found by overlaying a coordinate grid on the source and reading the
+// sphere's bounds directly off it, not guessed.
+const orbitRef = new Image();
+let orbitRefReady = false;
+orbitRef.onload = () => { orbitRefReady = true; };
+orbitRef.src = "assets/orbit-reference.png";
+const ORBIT_REF_SRC = { sx: 140, sy: 137, sw: 980, sh: 980 };
+
+function resize(){
+  // capped at 1x, not 2x — the background/ring gradients this face
+  // repaints are the real cost, and halving the pixel count per axis on a
+  // retina display cuts that by ~4x, the single biggest lever for
+  // low-power machines
+  DPR = Math.min(1, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  cx = W / 2; cy = H * 0.44;
+  R = Math.min(H, W) * 0.135;
+}
+addEventListener("resize", resize);
+resize();
+
+function roundRectPath(g, x, y, w, h, r){
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+/* state-driven motion constants, tuned per AV.state */
+const RING_SPEED = { idle: 0.06, listening: 0.10, thinking: 0.22, speaking: 0.30 };
+const BREATHE_AMT = { idle: 0.03, listening: 0.045, thinking: 0.03, speaking: 0.0 };
+const BREATHE_HZ  = { idle: 0.35, listening: 0.55, thinking: 0.9,  speaking: 0 };
+
+let ringAngle = 0;
+let clock = 0;
+let secondaryTiltPhase = 0;
+let echoAngle = 0;
+let coilPhase = 0;
+let workRingFade = 0;   // eases toward 1 while thinking/speaking, 0 otherwise
+
+// The reference isn't one flat centered gradient — it's a near-black base
+// with two separate soft glows overlaid: cool blue upper-left, warm violet
+// lower-right, leaving the top-right/bottom-left corners the darkest points
+// in the frame. Colors below are lifted from actual pixel samples of the
+// reference PNG, not guessed. Both glows drift a few percent and breathe in
+// brightness on slow, staggered ~2-minute cycles for a sense of depth —
+// deliberately too slow to read as "moving", just alive. Plain gradient
+// fillRect calls only, no shadowBlur, so this stays just as cheap per frame
+// as the flat gradient it replaces.
+function drawBackground(gctx, clock){
+  gctx.fillStyle = "#05060f";
+  gctx.fillRect(0, 0, W, H);
+
+  const driftB = Math.sin(clock * 0.05) * 0.035;
+  const blueX = W * (0.32 + driftB), blueY = H * (0.14 - driftB * 0.6);
+  const blueA = 0.85 + Math.sin(clock * 0.045) * 0.15;
+  const blue = gctx.createRadialGradient(blueX, blueY, 0, blueX, blueY, Math.max(W, H) * 0.62);
+  blue.addColorStop(0, `rgba(20,55,150,${0.68 * blueA})`);
+  blue.addColorStop(0.55, `rgba(12,32,100,${0.36 * blueA})`);
+  blue.addColorStop(1, "rgba(12,32,100,0)");
+  gctx.fillStyle = blue;
+  gctx.fillRect(0, 0, W, H);
+
+  const driftP = Math.sin(clock * 0.038 + 2.1) * 0.035;
+  const purpX = W * (0.78 + driftP), purpY = H * (0.78 - driftP * 0.5);
+  const purpA = 0.85 + Math.sin(clock * 0.052 + 1.4) * 0.15;
+  const purple = gctx.createRadialGradient(purpX, purpY, 0, purpX, purpY, Math.max(W, H) * 0.58);
+  purple.addColorStop(0, `rgba(85,20,165,${0.42 * purpA})`);
+  purple.addColorStop(0.55, `rgba(42,14,95,${0.22 * purpA})`);
+  purple.addColorStop(1, "rgba(42,14,95,0)");
+  gctx.fillStyle = purple;
+  gctx.fillRect(0, 0, W, H);
+}
+
+// Every drift term above is sub-0.1Hz — nothing in this background moves
+// fast enough for the eye to tell 10 repaints/sec from 60. Baked to an
+// offscreen sprite and only repainted on that slower clock, same
+// sprite-cache lesson as the ring end-glow below, just keyed on elapsed
+// time instead of a fixed parameter tuple since this one drifts
+// continuously rather than switching between discrete states.
+let bgSprite = null, bgSpriteW = 0, bgSpriteH = 0, bgSpriteClock = -999;
+const BG_REFRESH_SEC = 1 / 10;
+function getBackgroundSprite(clock){
+  if (!bgSprite) bgSprite = document.createElement("canvas");
+  const resized = bgSpriteW !== W || bgSpriteH !== H;
+  if (resized || clock - bgSpriteClock >= BG_REFRESH_SEC){
+    bgSprite.width = W; bgSprite.height = H;
+    drawBackground(bgSprite.getContext("2d"), clock);
+    bgSpriteW = W; bgSpriteH = H; bgSpriteClock = clock;
+  }
+  return bgSprite;
+}
+
+function frame(dt){
+  AV.tick(dt);
+  clock += dt / 1000;
+  const state = AV.state;
+  const env = AV.env || 0;          // 0..1 speech envelope, "speaking" only
+  const samples = AV.samples;       // Float32Array(64), 0..1
+
+  ringAngle += (RING_SPEED[state] ?? RING_SPEED.idle) * (dt / 1000);
+  secondaryTiltPhase += 0.12 * (dt / 1000);
+  const wantWork = (state === "thinking" || state === "speaking");
+  workRingFade += ((wantWork ? 1 : 0) - workRingFade) * Math.min(1, (dt / 1000) * 2.2);
+  echoAngle += (RING_SPEED[state] ?? RING_SPEED.idle) * 0.9 * (dt / 1000);
+  coilPhase += (state === "speaking" ? 2.4 : state === "thinking" ? 1.7 : 1.0) * (dt / 1000);
+
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.drawImage(getBackgroundSprite(clock), 0, 0);
+
+  /* Rings orbit at a fixed radius (R, never rescaled) so they read as a
+     stable structure the orb sits inside — the orb's own pulse (below)
+     is a separate, independent motion, not a shared scale.
+     One tilt, one orbit — a wide main ring (cyan-to-magenta, matching
+     the brand render) plus a thin, faint companion riding just outside
+     it, the way the reference shows a subtle second line hugging the
+     main band rather than a second ring crossing at its own angle.
+     The companion's own tilt drifts on a slow independent sine so it
+     doesn't just mechanically trail the main ring — it has its own
+     slight wobble, like a second orbit on a slightly different plane. */
+  const RING_TILT = -0.22;
+  const secondaryTilt = RING_TILT + Math.sin(secondaryTiltPhase) * 0.1;
+  const secondaryAlpha = 0.22 + Math.sin(secondaryTiltPhase * 1.7) * 0.05;
+  drawRing(R, 5.9, secondaryTilt, ringAngle * 0.9, secondaryAlpha, state, samples, true);
+  drawRing(R, 5.6, RING_TILT, ringAngle, 0.85, state, samples, false);
+  const glow = getRingEndGlowSprite(R, 5.6, RING_TILT, state);
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  ctx.drawImage(glow, 0, 0);
+  ctx.restore();
+  drawRingPulses(R, 5.6, RING_TILT, ringAngle, state, clock);
+
+  /* a third ring, present only while thinking or speaking — eased in and
+     out rather than a hard cut. Deliberately subtle: the exact same
+     gentle wobble formula as the secondary companion above, just on its
+     own phase, a beat behind, so it reads as a quiet echo of it rather
+     than a dramatic swing of its own. */
+  if (workRingFade > 0.01){
+    const echoTilt = RING_TILT + Math.sin(secondaryTiltPhase - 1.1) * 0.1;
+    const echoAlpha = (0.22 + Math.sin(secondaryTiltPhase * 1.7 - 1.1) * 0.05) * workRingFade;
+    drawRing(R, 6.15, echoTilt, echoAngle, echoAlpha, state, samples, true);
+
+    /* the real coiling effect — a thread that actually wraps around the
+       main ring's own tube as it travels, not another tilted ellipse at
+       a different angle. Only this one reads as "coiling around" it. */
+    drawCoilRing(R, 5.6, RING_TILT, ringAngle, 0.8 * workRingFade, coilPhase);
+  }
+
+  /* orb radius: gentle idle/listening/thinking breathing, a distinctly
+     stronger envelope-driven pulse while speaking — its own motion,
+     independent of the rings' fixed geometry above */
+  const breathe = state === "speaking"
+    ? 1 + env * 0.16
+    : 1 + Math.sin(clock * (BREATHE_HZ[state] ?? 0.35) * 6.2832) * (BREATHE_AMT[state] ?? 0.03);
+  const orbR = R * breathe;
+
+  /* the orb itself: glossy pearl sphere */
+  drawOrb(orbR, state, env);
+
+  /* bottom status pill: dot · NAME ACTIVE · waveform · state label */
+  drawStatusPill(state, samples);
+
+  requestAnimationFrame(() => frame(1000 / 60));
+}
+
+function drawOrb(orbR, state, env){
+  ctx.save();
+  // outer glow — soft atmosphere around the orb, independent of the
+  // sphere's own material. Spread over a much bigger radius with several
+  // gradual stops rather than one sharp fade, which reads as a defined
+  // ring no matter how low the alpha is — same fix as the Default face's
+  // ground glow needed.
+  const glowR = orbR * (3.2 + env * 0.5);
+  // inner stop sits just past the ball's own radius, not overlapping it —
+  // any overlap bleeds through the clipped image's antialiased edge below
+  // as a faint ring, since that edge is never perfectly opaque
+  const glow = ctx.createRadialGradient(cx, cy, orbR * 1.04, cx, cy, glowR);
+  const glowA = state === "idle" ? 0.05 : state === "listening" ? 0.07 : state === "thinking" ? 0.08 : 0.1 + env * 0.09;
+  glow.addColorStop(0, `rgba(140,170,255,${glowA})`);
+  glow.addColorStop(0.18, `rgba(140,170,255,${glowA * 0.7})`);
+  glow.addColorStop(0.4, `rgba(140,170,255,${glowA * 0.38})`);
+  glow.addColorStop(0.65, `rgba(140,170,255,${glowA * 0.15})`);
+  glow.addColorStop(0.86, `rgba(140,170,255,${glowA * 0.04})`);
+  glow.addColorStop(1, "rgba(140,170,255,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(cx, cy, glowR, 0, 6.2832); ctx.fill();
+
+  // the sphere itself: the actual brand reference render, not a painted
+  // approximation of it — Seb's call, stop repainting the material by
+  // hand and use the real image, cropped to just the ball (ORBIT_REF_SRC,
+  // found by overlaying a coordinate grid on the source and reading its
+  // bounds directly, not guessed) and scaled to the orb's current radius.
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.clip();
+  if (orbitRefReady){
+    // drawn slightly oversized relative to the clip circle — the source
+    // crop carries a few pixels of the reference's own background margin
+    // around the ball, and at an exact 1:1 fit that margin shows up as a
+    // faint ring right at the clip edge. Zooming past it pushes that
+    // margin outside the visible circle instead.
+    const d = orbR * 2.02;
+    ctx.drawImage(
+      orbitRef, ORBIT_REF_SRC.sx, ORBIT_REF_SRC.sy, ORBIT_REF_SRC.sw, ORBIT_REF_SRC.sh,
+      cx - d / 2, cy - d / 2, d, d
+    );
+  } else {
+    // a flat pale fallback for the handful of frames before the image
+    // has loaded, so there's never a hole where the orb should be
+    ctx.fillStyle = "#d7d9ea";
+    ctx.fillRect(cx - orbR, cy - orbR, orbR * 2, orbR * 2);
+  }
+
+  // exposure: the animated part, a soft screen-blended glow laid over
+  // the static image rather than repainting it, brightening with the
+  // live speech envelope while speaking and sitting a notch hotter than
+  // idle while thinking — "it's lit up and working," without needing to
+  // fake the material's own lighting procedurally.
+  const exposure = state === "speaking" ? 0.1 + env * 0.3
+    : state === "thinking" ? 0.16
+    : state === "listening" ? 0.08
+    : 0.04 + Math.sin(clock * 0.9) * 0.02;
+  if (exposure > 0.01){
+    ctx.globalCompositeOperation = "screen";
+    const exp = ctx.createRadialGradient(
+      cx - orbR * 0.15, cy - orbR * 0.15, 0,
+      cx, cy, orbR * 1.05
+    );
+    exp.addColorStop(0, `rgba(255,255,255,${exposure})`);
+    exp.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = exp;
+    ctx.beginPath(); ctx.arc(cx, cy, orbR, 0, 6.2832); ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+  }
+  ctx.restore();
+
+  ctx.restore();
+}
+
+// One tilt, one orbit. `thin` draws the faint companion line that hugs
+// just outside the main band — matching the reference's subtle second
+// line, not a second ring crossing at its own angle.
+function drawRing(baseR, radiusMult, tilt, angle, baseAlpha, state, samples, thin){
+  const rx = baseR * radiusMult;
+  const ry = rx * 0.256;
+  const activeBoost = state === "idle" ? 0 : state === "listening" ? 0.15 : state === "thinking" ? 0.55 : 0.9;
+  const alpha = Math.min(1, baseAlpha * (0.5 + activeBoost));
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+
+  const segs = 120;
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++){
+    const t = (i / segs) * 6.2832 + angle;
+    // during speaking, let the real waveform ripple the ring radius —
+    // averaged across a small window so it reads as a smooth swell,
+    // not per-vertex noise
+    let wobble = 0;
+    if (state === "speaking" && !thin){
+      // map the vertex continuously across the 64-sample window instead of
+      // `i % 64` — with 120 segments that modulo wraps mid-loop (at i=64)
+      // AND at closePath (i=120 vs i=0), each wrap jumping straight from
+      // sample 63 to sample 0 with no interpolation, which is exactly the
+      // kink that read as a jagged ring while speaking. A single continuous
+      // sweep plus interpolation removes both seams.
+      const pos = (i / segs) * 64;
+      const base = Math.floor(pos) % 64;
+      const frac = pos - Math.floor(pos);
+      const sPrev = samples[(base + 63) % 64] || 0, sA = samples[base] || 0,
+            sB = samples[(base + 1) % 64] || 0, sNext = samples[(base + 2) % 64] || 0;
+      const smoothed0 = (sPrev + sA + sB) / 3;
+      const smoothed1 = (sA + sB + sNext) / 3;
+      wobble = (smoothed0 + (smoothed1 - smoothed0) * frac) * baseR * 0.04;
+    }
+    const px = Math.cos(t) * (rx + wobble);
+    const py = Math.sin(t) * (ry + wobble * 0.256);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+
+  // cyan on the near side, through a pale white crest, to a vivid
+  // magenta-violet on the far tip — the brand render's exact split
+  const grad = ctx.createLinearGradient(-rx, 0, rx, 0);
+  grad.addColorStop(0, `rgba(20,160,225,${alpha})`);
+  grad.addColorStop(0.5, `rgba(210,205,255,${alpha * 0.85})`);
+  grad.addColorStop(1, `rgba(205,90,255,${alpha})`);
+  // wide, soft ambient halo along the whole tube first — the reference
+  // reads as lit along its entire length, not just at the two tips
+  // (drawRingEndGlow handles those separately); reuses this same path.
+  // Scales with activeBoost so thinking/speaking read as noticeably more
+  // lit than idle/listening, not just the crisp core line underneath.
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = thin ? 3 + activeBoost * 2 : 7 + activeBoost * 5;
+  ctx.shadowColor = "#a070ff";
+  ctx.shadowBlur = thin ? 16 + activeBoost * 10 : 34 + activeBoost * 24;
+  ctx.globalAlpha = Math.min(1, (thin ? 0.4 : 0.6) + activeBoost * 0.35);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // the crisp core stroke on top, unchanged in look from before
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = thin ? 0.8 : (state === "speaking" ? 2.2 : 1.5);
+  ctx.shadowColor = "#a070ff";
+  ctx.shadowBlur = thin ? 9 : 22 + activeBoost * 14;
+  ctx.stroke();
+
+  // a crisp, near-white core down the middle of the main ring — the
+  // reference reads as a bright neon tube, not a flat colored stroke
+  if (!thin){
+    const core = ctx.createLinearGradient(-rx, 0, rx, 0);
+    core.addColorStop(0, `rgba(200,235,255,${alpha * 0.75})`);
+    core.addColorStop(0.5, `rgba(255,255,255,${alpha * 0.9})`);
+    core.addColorStop(1, `rgba(240,210,255,${alpha * 0.75})`);
+    ctx.strokeStyle = core;
+    ctx.lineWidth = 0.6;
+    ctx.shadowBlur = 6;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// A thread that actually wraps around the main ring's own tube, not just
+// another ellipse riding at a different tilt. Walks the exact same
+// parametric path as the main ring, then displaces each point sideways,
+// perpendicular to the ring's direction of travel at that point, by a
+// sine wave whose frequency is high enough to read as repeated wraps
+// along the loop. Advancing that sine's phase over time makes the wrap
+// itself appear to travel around the band, like a coil slowly turning.
+function drawCoilRing(baseR, radiusMult, tilt, angle, alpha, phase){
+  const rx = baseR * radiusMult, ry = rx * 0.256;
+  const wraps = 34;
+  const amp = baseR * 0.05;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+  ctx.globalCompositeOperation = "screen";
+
+  // enough points per wrap to stay smooth even at a tight wrap count —
+  // fewer than ~15-20 samples per wrap starts reading as jagged/aliased
+  // rather than a clean coiled wire
+  const segs = wraps * 20;
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++){
+    const t = (i / segs) * 6.2832 + angle;
+    const bx = Math.cos(t) * rx, by = Math.sin(t) * ry;
+    // tangent direction at t (derivative of the ellipse parametric eq),
+    // rotated 90 degrees to get the perpendicular the coil rides along
+    const tdx = -Math.sin(t) * rx, tdy = Math.cos(t) * ry;
+    const tlen = Math.hypot(tdx, tdy) || 1;
+    const nx = -tdy / tlen, ny = tdx / tlen;
+    const wobble = Math.sin(t * wraps + phase) * amp;
+    const px = bx + nx * wobble, py = by + ny * wobble;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.strokeStyle = `rgba(225,235,255,${alpha})`;
+  ctx.lineWidth = 1.1;
+  ctx.shadowColor = "#bfe4ff";
+  ctx.shadowBlur = 8;
+  ctx.stroke();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+}
+
+// The reference reads as the RING ITSELF being brighter at each end —
+// a lit filament, not a separate light stamped near it. Trace the same
+// parametric curve as the ring near each tip and fade the alpha
+// exponentially with arc-distance from the tip, layered at a few
+// widths so it builds up like a glowing neon end rather than a flat
+// stroke or a disconnected radial blob.
+//
+// This is ~360 shadowed stroke() calls (the single heaviest thing drawn
+// each frame — shadowBlur forces a real blur pass per call). Its shape
+// only depends on baseR/radiusMult/tilt/state, none of which change
+// frame-to-frame, so it's rendered once onto an offscreen sprite by
+// getRingEndGlowSprite() below and just stamped back with drawImage —
+// same pixels, computed once instead of 60x/sec. Screen-blending is
+// associative, so pre-combining these layers in an isolated buffer and
+// then screening the whole sprite onto the frame is pixel-identical to
+// screening each stroke onto the frame directly.
+function drawRingEndGlow(gctx, baseR, radiusMult, tilt, state){
+  const rx = baseR * radiusMult, ry = rx * 0.256;
+  const activeBoost = state === "idle" ? 0 : state === "listening" ? 0.15 : state === "thinking" ? 0.55 : 0.9;
+  const boost = 1 + activeBoost * 0.7;
+  const pt = t => [Math.cos(t) * rx, Math.sin(t) * ry];
+
+  gctx.save();
+  gctx.translate(cx, cy);
+  gctx.rotate(tilt);
+  gctx.globalCompositeOperation = "screen";
+
+  const ends = [
+    { tAngle: Math.PI, rgb: "20,160,225" },  // cyan, near side
+    { tAngle: 0,        rgb: "220,100,255" }, // magenta, far tip — the render's hottest point
+  ];
+  // wide soft layer first, then progressively tighter/brighter — builds
+  // a proper bloom instead of one hard-edged stroke. Brightened across
+  // the board per Seb's call: bigger radius, hotter peaks, so the tips
+  // read as genuinely blown-out light sources like the reference, not
+  // just a slightly warmer patch of the ring's own color.
+  const layers = [
+    { width: 22, blur: 46, peak: 0.48 },
+    { width: 11, blur: 28, peak: 0.78 },
+    { width: 4,  blur: 15, peak: Math.min(1, 1.05 * boost) },
+  ];
+  const span = 0.7, step = 0.02;
+  for (const e of ends){
+    for (const layer of layers){
+      gctx.lineWidth = layer.width;
+      gctx.shadowColor = `rgb(${e.rgb})`;
+      gctx.shadowBlur = layer.blur;
+      for (let s = -span; s < span; s += step){
+        const decay = Math.exp(-Math.abs(s) / 0.22);   // exponential falloff along the arc
+        const alpha = layer.peak * decay;
+        if (alpha < 0.008) continue;
+        const [x0, y0] = pt(e.tAngle + s);
+        const [x1, y1] = pt(e.tAngle + s + step);
+        gctx.strokeStyle = `rgba(${e.rgb},${alpha})`;
+        gctx.beginPath(); gctx.moveTo(x0, y0); gctx.lineTo(x1, y1); gctx.stroke();
+      }
+    }
+    // the hottest point: a near-white core right at the very tip, the way
+    // an overdriven light source blows out to white at its source
+    const [tx, ty] = pt(e.tAngle);
+    gctx.shadowBlur = 14;
+    gctx.shadowColor = "#ffffff";
+    gctx.fillStyle = `rgba(255,255,255,${Math.min(1, boost)})`;
+    gctx.beginPath(); gctx.arc(tx, ty, 3.6, 0, 6.2832); gctx.fill();
+  }
+  gctx.restore();
+}
+
+let glowSprite = null;
+let glowSpriteKey = "";
+
+function getRingEndGlowSprite(baseR, radiusMult, tilt, state){
+  const key = `${W}x${H}|${baseR.toFixed(2)}|${radiusMult}|${tilt}|${state}`;
+  if (glowSprite && glowSpriteKey === key) return glowSprite;
+  if (!glowSprite) glowSprite = document.createElement("canvas");
+  glowSprite.width = W;   // also clears any previous, now-stale content
+  glowSprite.height = H;
+  drawRingEndGlow(glowSprite.getContext("2d"), baseR, radiusMult, tilt, state);
+  glowSpriteKey = key;
+  return glowSprite;
+}
+
+// Bright packets of light traveling along the main ring, always present
+// (idling slowly at rest, quickening with state) rather than only
+// appearing while "thinking" — this is the ring's idle motion, not a
+// one-state-only effect. Each packet trails a short fading comet of
+// light behind it instead of a single flat dot, so the ring reads as
+// actively transmitting something around its length — more packets and
+// a longer trail while actively working (thinking) or talking (speaking).
+//
+// Cost-conscious on purpose: shadowBlur is the one canvas operation that
+// actually costs real time (a software blur pass per call, not just a
+// fill), so it's spent once per packet, on its head only. The fading
+// tail behind it is plain unshadowed fills, cheap regardless of how long
+// the trail runs — a trail of 8 costs barely more than a trail of 2.
+const PULSE_SPEED = { idle: 0.5, listening: 0.8, thinking: 1.6, speaking: 2.4 };
+const PULSE_COUNT = { idle: 1, listening: 2, thinking: 4, speaking: 4 };
+const TRAIL_LEN   = { idle: 4, listening: 5, thinking: 7, speaking: 7 };
+function drawRingPulses(baseR, radiusMult, tilt, angle, state, clock){
+  const rx = baseR * radiusMult, ry = rx * 0.256;
+  const n = PULSE_COUNT[state] ?? 1;
+  const speed = PULSE_SPEED[state] ?? 0.5;
+  const trailLen = TRAIL_LEN[state] ?? 4;
+  const trailSpacing = 0.045;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+  for (let k = 0; k < n; k++){
+    const tHead = angle + (k / n) * 6.2832 + clock * speed;
+    for (let trail = 0; trail < trailLen; trail++){
+      const t = tHead - trail * trailSpacing;
+      const px = Math.cos(t) * rx, py = Math.sin(t) * ry;
+      // brighter near the magenta tip, matching the render's hot point
+      const warmth = (Math.cos(t) + 1) / 2;
+      const fade = 1 - trail / trailLen;
+      const size = 2.8 * (0.35 + fade * 0.65);
+      ctx.beginPath();
+      ctx.arc(px, py, size, 0, 6.2832);
+      ctx.fillStyle = `rgba(${255},${230 - warmth * 40},${255},${0.95 * fade})`;
+      if (trail === 0){
+        ctx.shadowColor = "#ffffff";
+        ctx.shadowBlur = 9;
+      } else {
+        ctx.shadowBlur = 0;
+      }
+      ctx.fill();
+    }
+  }
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawStatusPill(state, samples){
+  const label = { idle: "Idle", listening: "Listening...", thinking: "Thinking...", speaking: "Speaking..." }[state] || "Idle";
+  const on = state !== "idle";
+  const pillW = Math.min(520, W * 0.42), pillH = 44;
+  const px = cx - pillW / 2, py = H - Math.max(48, H * 0.09) - pillH / 2;
+
+  ctx.save();
+  roundRectPath(ctx, px, py, pillW, pillH, pillH / 2);
+  ctx.fillStyle = "rgba(15,18,38,0.68)";
+  ctx.fill();
+  ctx.strokeStyle = `rgba(138,107,255,${on ? 0.4 : 0.22})`;
+  ctx.lineWidth = 1;
+  ctx.shadowColor = "#8a6bff";
+  ctx.shadowBlur = on ? 12 : 4;
+  ctx.stroke();
+  ctx.restore();
+
+  const midY = py + pillH / 2;
+
+  // status dot — same blue-to-violet brand gradient as the top-right panel
+  const dotGrad = ctx.createLinearGradient(px + 20, midY, px + 28, midY);
+  dotGrad.addColorStop(0, "#4fc3ff");
+  dotGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = dotGrad;
+  ctx.globalAlpha = on ? 0.95 : 0.55;
+  ctx.beginPath(); ctx.arc(px + 24, midY, 3, 0, 6.2832); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // "<NAME> ACTIVE" on the left, state label on the right, waveform
+  // filling whatever real space is left between them — measured off the
+  // actual rendered text each frame, not a fixed fraction of the pill.
+  // The old fixed cx-centered band only worked for one specific name
+  // length; "MERIDIAN ACTIVE" alone is long enough at this font size to
+  // run straight into it, which is exactly the overlap this fixes — and
+  // it now holds for any name someone picks, not just this one.
+  ctx.textAlign = "left";
+  ctx.font = "500 12px -apple-system, 'SF Pro Display', sans-serif";
+  ctx.letterSpacing = "2px";
+  const nameText = (AV.name || "MERIDIAN").toUpperCase() + " ACTIVE";
+  const nameX = px + 40;
+  ctx.fillStyle = "rgba(230,238,250,0.9)";
+  ctx.fillText(nameText, nameX, midY + 4);
+  const nameWidth = ctx.measureText(nameText).width;
+  ctx.letterSpacing = "0px";
+
+  ctx.textAlign = "right";
+  ctx.font = "400 12px -apple-system, 'SF Pro Display', sans-serif";
+  const labelWidth = ctx.measureText(label).width;
+
+  const barsGap = 16;
+  const barsX0 = nameX + nameWidth + barsGap;
+  const barsX1 = (px + pillW - 24) - labelWidth - barsGap;
+  const barsN = 40, barW = Math.max(0, (barsX1 - barsX0) / barsN);
+  const barGrad = ctx.createLinearGradient(barsX0, 0, barsX0 + barsN * barW, 0);
+  barGrad.addColorStop(0, "#4fc3ff");
+  barGrad.addColorStop(1, "#8a6bff");
+  ctx.fillStyle = barGrad;
+  for (let i = 0; i < barsN; i++){
+    const s = samples[Math.floor(i * 64 / barsN)] || 0;
+    const amp = state === "speaking" ? s
+      : state === "listening" ? 0.06 + 0.04 * Math.abs(Math.sin(i * 0.7 + clock * 3))
+      : 0.04 + 0.02 * Math.sin(i * 0.5 + clock * 1.2);
+    const barH = Math.max(1.5, amp * 20);
+    ctx.globalAlpha = on ? 0.4 + 0.55 * amp : 0.22;
+    ctx.fillRect(barsX0 + i * barW, midY - barH / 2, barW * 0.5, barH);
+  }
+  ctx.globalAlpha = 1;
+
+  // state label, right-aligned
+  ctx.textAlign = "right";
+  ctx.letterSpacing = "0.6px";
+  ctx.fillStyle = on ? "rgba(150,200,240,0.85)" : "rgba(140,155,180,0.6)";
+  ctx.fillText(label, px + pillW - 24, midY + 4);
+  ctx.letterSpacing = "0px";
+}
+
+requestAnimationFrame(() => frame(16.6));
+</script>
+</body>
+</html>

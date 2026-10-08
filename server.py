@@ -25,8 +25,14 @@ Serves the face gallery at http://127.0.0.1:8790/ and exposes:
             "level":  0.0-1.0,       voice loudness while speaking
             "samples": [64 floats],  raw waveform snapshot (0s when quiet)
             "alert":  bool,          optional attention signal
-            "loading": bool}         true while the voice line plays its
+            "loading": bool,         true while the voice line plays its
                                      own thinking sound (we stay quiet)
+            "tasks": [{"id": str, "label": str}, ...]}  every tool call
+                                     currently executing, in plain
+                                     English, while the brain works
+                                     quietly — can hold more than one
+                                     entry when the brain runs several
+                                     tool calls in parallel
   /config  the merged ai-visualizer.json plus the list of installed
            faces, discovered by scanning the faces/ folder. Drop a new
            folder with an index.html into faces/ and it appears in the
@@ -39,6 +45,8 @@ voice line (backtalk writes them natively, github.com/jaredrhod/backtalk):
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid  exists while the voice line plays a thinking sound
   .voice_alert        optional: non-empty file = attention needed
+  .voice_task         optional: JSON list of {id, ts, label}, one entry
+                       per tool call currently executing
 
 Where the bus lives comes from "bus_dir" in ai-visualizer.json (default:
 this folder). Point it at your backtalk folder, or point backtalk's
@@ -68,6 +76,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 STATES = {"idle", "listening", "thinking", "speaking"}
 WAVEFORM_STALE_S = 0.6
+TASK_STALE_S = 30.0   # safety net: an unclearable stuck label expires
 
 DEFAULTS = {
     "name": "JARVIS",       # shown on the chip / headers, yours to change
@@ -139,6 +148,12 @@ def mock_bus():
         ]
     return {"state": MOCK, "level": level, "samples": samples,
             "alert": False, "loading": MOCK == "thinking",
+            # Faked so a face's task panel can be looked at without
+            # spending a real session to make it appear — two entries,
+            # so the multi-task list panel has something real to show.
+            "tasks": [{"id": "mock-1", "label": "Searching the web"},
+                      {"id": "mock-2", "label": "Reading a file"}]
+                    if MOCK == "thinking" else [],
             # Faked so the usage readout can be looked at without
             # spending a real session to make it appear.
             "rate_limits": {
@@ -175,6 +190,21 @@ def read_bus():
     except OSError:
         alert = False
     loading = (BUS / ".voice_loading_pid").exists()
+    tasks = []
+    try:
+        now = time.time()
+        payload = json.loads((BUS / ".voice_task").read_text())
+        for entry in payload:
+            label = entry.get("label")
+            tid = entry.get("id")
+            age = now - float(entry.get("ts", 0))
+            # Per-entry staleness, not all-or-nothing: one stuck task
+            # (a killed subprocess that never fired its PostToolUse
+            # hook) shouldn't hide every other genuinely-running task.
+            if label and tid is not None and age < TASK_STALE_S:
+                tasks.append({"id": str(tid), "label": str(label)})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
     # Absent unless the voice line was told to publish it, which is the
     # normal case: it is the account holder's own spend and it stays off
     # until asked for. An empty dict simply means no readout.
@@ -184,7 +214,8 @@ def read_bus():
     except (OSError, ValueError):
         pass
     return {"state": state, "level": level, "samples": samples,
-            "alert": alert, "loading": loading, "rate_limits": rate_limits}
+            "alert": alert, "loading": loading, "tasks": tasks,
+            "rate_limits": rate_limits}
 
 
 class Handler(BaseHTTPRequestHandler):

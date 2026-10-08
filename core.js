@@ -30,6 +30,13 @@
                    adaptively normalized — use this for motion)
      AV.samples    Float32Array(64), 0..1 normalized waveform ring
      AV.alert      bool, optional attention signal
+     AV.tasks      [{id, label}, ...] — every tool call currently
+                   executing while the brain is quietly working; can
+                   hold more than one entry when several tools run in
+                   parallel. Drives the floating, draggable task-list
+                   panel core.js injects into every face (left side,
+                   one row per active entry, same HUD language as the
+                   rest of the chrome)
      AV.micLevel   0..1 your microphone (only if init({mic:true}))
      AV.name       display name from config ("JARVIS" by default)
      AV.label      the dotted chip label ("J.A.R.V.I.S.")
@@ -65,7 +72,7 @@ const AV = (() => {
 
   const A = {
     state: "idle", level: 0, env: 0, alert: false, micLevel: 0,
-    samples: new Float32Array(64),
+    samples: new Float32Array(64), tasks: [],
     name: "JARVIS", label: "J.A.R.V.I.S.", badge: "",
     demo: DEMO, shot: SHOT, faces: [],
     _sndOn: true, _mic: false, _readyCbs: [], _ready: false,
@@ -92,7 +99,7 @@ const AV = (() => {
 
   /* ------------------------------ bus polling ------------------------------ */
   let raw = { state: "idle", level: 0, samples: null, alert: false,
-              loading: false };
+              loading: false, tasks: [] };
   if (!DEMO) {
     setInterval(async () => {
       try {
@@ -136,7 +143,15 @@ const AV = (() => {
         : 0;
     }
     raw = { state: st, level: speaking ? Math.min(1, cadence) : 0,
-            samples, alert: false, loading: false };
+            samples, alert: false, loading: false,
+            // Two entries while "thinking" so the demo honestly shows
+            // the panel's real job (several concurrent tasks), not
+            // just a single-item list that looks the same as the old
+            // one-at-a-time chip ever did.
+            tasks: st === "thinking"
+              ? [{ id: "demo-1", label: "Searching the web" },
+                 { id: "demo-2", label: "Reading a file" }]
+              : [] };
     if (st === "listening")
       A.micLevel = 0.25 + 0.55 * Math.abs(Math.sin(tt * 2.7))
         * Math.abs(Math.sin(tt * 0.61));
@@ -148,6 +163,8 @@ const AV = (() => {
     if (DEMO) demoUpdate(dt);
     A.state = raw.state || "idle";
     A.alert = !!raw.alert;
+    A.tasks = raw.tasks || [];
+    taskListUpdate();
     // Empty unless the voice line was told to publish usage. A face that
     // wants to draw it reads AV.rateLimits; every other face ignores it.
     A.rateLimits = raw.rate_limits || {};
@@ -269,6 +286,162 @@ const AV = (() => {
     }
   }
 
+  /* ------------------------- active-task list panel -------------------------
+     A small floating, draggable panel listing every tool call currently
+     running — not just the most recent one. Same dark/blue HUD language as
+     a face's own waveform pill, so it reads as part of the same system
+     rather than a bolted-on widget. Lives in core.js (not a per-face
+     canvas) so every face gets it for free and dragging is just native
+     DOM, no per-face render-loop plumbing.
+
+     Rows are diffed by id (AV.tasks[i].id, the SDK's own tool_use_id):
+     a row is created once when its id first appears and removed once its
+     id disappears, so several concurrent tasks each get their own live
+     row instead of one shared slot overwriting itself — that overwrite
+     was the actual bug behind the old single-chip version only ever
+     reading as "on" sometimes. -------------------------------------- */
+  let panelEl = null, rowsEl = null, headCountEl = null;
+  let panelShown = false;
+  const rowEls = new Map();   // task id -> row element
+  let dragging = false, dragDX = 0, dragDY = 0;
+
+  function panelPos() {
+    try {
+      const saved = JSON.parse(localStorage.getItem("av_tasklist_pos") || "null");
+      if (saved && typeof saved.top === "number" && typeof saved.left === "number")
+        return saved;
+    } catch (e) {}
+    return { top: 90, left: 24 };   // left side, clear of most faces' chrome
+  }
+  function panelSavePos(top, left) {
+    try { localStorage.setItem("av_tasklist_pos", JSON.stringify({ top, left })); }
+    catch (e) {}
+  }
+
+  function taskListInit() {
+    if (SHOT) return;
+    const style = document.createElement("style");
+    style.textContent = `
+      @keyframes av-task-dot { 0%,100%{opacity:.4} 50%{opacity:1} }
+      @keyframes av-task-ellipsis { 0%,100%{opacity:.25} 50%{opacity:1} }
+      @keyframes av-task-row-in {
+        from{opacity:0;transform:translateX(-6px)} to{opacity:1;transform:translateX(0)} }
+      #av-task-panel{position:fixed;z-index:60;min-width:190px;max-width:300px;
+        background:rgba(8,12,22,.78);border:1px solid rgba(120,160,210,.32);
+        border-radius:10px;padding:10px 14px 11px;
+        box-shadow:0 0 22px rgba(90,190,255,.14),0 4px 18px rgba(0,0,0,.35);
+        font:12px "SF Mono",Menlo,Consolas,monospace;color:rgba(230,238,250,.92);
+        cursor:grab;user-select:none;opacity:0;pointer-events:none;
+        transform:translateY(-4px);transition:opacity .25s,transform .25s;}
+      #av-task-panel.on{opacity:1;pointer-events:auto;transform:translateY(0)}
+      #av-task-panel.dragging{cursor:grabbing;transition:none}
+      #av-task-panel .av-task-head{display:flex;align-items:center;gap:7px;
+        letter-spacing:.2em;font-size:10px;color:rgba(150,200,240,.85)}
+      #av-task-panel .av-task-dot{width:6px;height:6px;border-radius:50%;flex:none;
+        background:rgba(110,200,255,.95);animation:av-task-dot 1.1s ease-in-out infinite}
+      #av-task-panel .av-task-rows{margin-top:7px;display:flex;
+        flex-direction:column;gap:5px}
+      #av-task-panel .av-task-row{display:flex;align-items:baseline;gap:7px;
+        animation:av-task-row-in .22s ease-out}
+      #av-task-panel .av-task-row-label{font-size:12px;color:rgba(230,238,250,.92);
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
+      #av-task-panel .av-task-row-dots{display:inline-flex;gap:2px;flex:none}
+      #av-task-panel .av-task-row-dots i{width:3px;height:3px;border-radius:50%;
+        display:block;background:rgba(120,200,255,.85);
+        animation:av-task-ellipsis 1s ease-in-out infinite}
+    `;
+    document.head.appendChild(style);
+
+    panelEl = document.createElement("div");
+    panelEl.id = "av-task-panel";
+    const head = document.createElement("div");
+    head.className = "av-task-head";
+    head.innerHTML = `<span class="av-task-dot"></span><span>WORKING</span>` +
+      `<span class="av-task-head-count"></span>`;
+    headCountEl = head.querySelector(".av-task-head-count");
+    rowsEl = document.createElement("div");
+    rowsEl.className = "av-task-rows";
+    panelEl.appendChild(head);
+    panelEl.appendChild(rowsEl);
+    document.body.appendChild(panelEl);
+
+    const p = panelPos();
+    panelEl.style.top = p.top + "px";
+    panelEl.style.left = p.left + "px";
+
+    panelEl.addEventListener("pointerdown", e => {
+      dragging = true;
+      panelEl.classList.add("dragging");
+      panelEl.setPointerCapture(e.pointerId);
+      const r = panelEl.getBoundingClientRect();
+      dragDX = e.clientX - r.left;
+      dragDY = e.clientY - r.top;
+    });
+    panelEl.addEventListener("pointermove", e => {
+      if (!dragging) return;
+      const left = Math.min(innerWidth - 40, Math.max(0, e.clientX - dragDX));
+      const top = Math.min(innerHeight - 30, Math.max(0, e.clientY - dragDY));
+      panelEl.style.left = left + "px";
+      panelEl.style.top = top + "px";
+    });
+    const stopDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      panelEl.classList.remove("dragging");
+      const r = panelEl.getBoundingClientRect();
+      panelSavePos(r.top, r.left);
+    };
+    panelEl.addEventListener("pointerup", stopDrag);
+    panelEl.addEventListener("pointercancel", stopDrag);
+  }
+
+  function taskListMakeRow(label) {
+    const row = document.createElement("div");
+    row.className = "av-task-row";
+    const dots = document.createElement("span");
+    dots.className = "av-task-row-dots";
+    for (let i = 0; i < 3; i++) {
+      const d = document.createElement("i");
+      d.style.animationDelay = (i * 0.15).toFixed(2) + "s";
+      dots.appendChild(d);
+    }
+    const lab = document.createElement("span");
+    lab.className = "av-task-row-label";
+    lab.textContent = label;
+    row.appendChild(dots);
+    row.appendChild(lab);
+    return row;
+  }
+
+  function taskListUpdate() {
+    if (!panelEl) return;
+    const tasks = A.tasks || [];
+    const liveIds = new Set(tasks.map(t => t.id));
+
+    // remove rows for ids no longer active
+    for (const [id, row] of rowEls) {
+      if (!liveIds.has(id)) {
+        row.remove();
+        rowEls.delete(id);
+      }
+    }
+    // add rows for newly-seen ids, in the order the bus reports them
+    for (const t of tasks) {
+      if (!rowEls.has(t.id)) {
+        const row = taskListMakeRow(t.label);
+        rowsEl.appendChild(row);
+        rowEls.set(t.id, row);
+      }
+    }
+
+    const shown = tasks.length > 0;
+    if (shown !== panelShown) {
+      panelShown = shown;
+      panelEl.classList.toggle("on", shown);
+    }
+    headCountEl.textContent = tasks.length > 1 ? ` · ${tasks.length}` : "";
+  }
+
   /* ------------------------------ shot harness ----------------------------- */
   // Runs the face's frame() deterministically (a synchronous burst of t ms).
   // A headless browser resizes the window and finishes loading images AFTER
@@ -293,6 +466,7 @@ const AV = (() => {
     A._mic = !!opts.mic;
     if (A._mic && !DEMO) micStart();
     if (opts.sound !== false) soundInit(); else A._sndWant = false;
+    taskListInit();
     if (DEMO) {
       applyConfig({ name: Q.get("name") || "JARVIS" });
     } else {
