@@ -30,13 +30,16 @@
                    adaptively normalized — use this for motion)
      AV.samples    Float32Array(64), 0..1 normalized waveform ring
      AV.alert      bool, optional attention signal
-     AV.tasks      [{id, label}, ...] — every tool call currently
+     AV.tasks      [{id, ts, label}, ...] — every tool call currently
                    executing while the brain is quietly working; can
                    hold more than one entry when several tools run in
-                   parallel. Drives the floating, draggable task-list
-                   panel core.js injects into every face (left side,
-                   one row per active entry, same HUD language as the
-                   rest of the chrome)
+                   parallel. Drives the floating, draggable status bar
+                   core.js injects into every face: a compact pill
+                   that's ALWAYS on screen (idle, listening, thinking,
+                   speaking — not just while a tool call is running),
+                   expandable to show the current task plus every other
+                   one running in the background, each timed off its
+                   own real start (ts), never a fabricated percentage.
      AV.micLevel   0..1 your microphone (only if init({mic:true}))
      AV.name       display name from config ("JARVIS" by default)
      AV.label      the dotted chip label ("J.A.R.V.I.S.")
@@ -118,11 +121,12 @@ const AV = (() => {
   function demoUpdate(dt) {
     demoClock += dt;
     let st = PIN || "idle";
+    let elapsedMs = demoClock;   // pinned (?state=) never leaves this state
     if (!PIN) {
       demoT = (demoT + dt) % SCRIPT.reduce((a, s) => a + s[1], 0);
       let t = demoT;
       for (const [name, len] of SCRIPT) {
-        if (t < len) { st = name; break; }
+        if (t < len) { st = name; elapsedMs = t; break; }
         t -= len;
       }
     }
@@ -149,8 +153,10 @@ const AV = (() => {
             // just a single-item list that looks the same as the old
             // one-at-a-time chip ever did.
             tasks: st === "thinking"
-              ? [{ id: "demo-1", label: "Searching the web" },
-                 { id: "demo-2", label: "Reading a file" }]
+              ? [{ id: "demo-1", label: "Searching the web",
+                   ts: Date.now() / 1000 - elapsedMs / 1000 },
+                 { id: "demo-2", label: "Reading a file",
+                   ts: Date.now() / 1000 - elapsedMs / 2000 }]
               : [] };
     if (st === "listening")
       A.micLevel = 0.25 + 0.55 * Math.abs(Math.sin(tt * 2.7))
@@ -286,24 +292,35 @@ const AV = (() => {
     }
   }
 
-  /* ------------------------- active-task list panel -------------------------
-     A small floating, draggable panel listing every tool call currently
-     running — not just the most recent one. Same dark/blue HUD language as
-     a face's own waveform pill, so it reads as part of the same system
-     rather than a bolted-on widget. Lives in core.js (not a per-face
-     canvas) so every face gets it for free and dragging is just native
-     DOM, no per-face render-loop plumbing.
+  /* ---------------------------- status bar panel -----------------------------
+     A floating, draggable status bar — ALWAYS on screen, in every state
+     (idle, listening, thinking, speaking), not just while a tool call is
+     running. Visual language: compact dark pill (dot, state label, mini
+     waveform, current line, background-count badge, chevron), expanding
+     into a current-task row plus every other concurrent tool call as a
+     background-tasks list. Styled from Seb's own two reference mocks
+     (2026-10-08: "Hugo AI taskbar" / "App building with PDF tasks").
+     Lives in core.js (not a per-face canvas) so every face gets it for
+     free and dragging is just native DOM, no per-face render-loop plumbing.
 
-     Rows are diffed by id (AV.tasks[i].id, the SDK's own tool_use_id):
-     a row is created once when its id first appears and removed once its
-     id disappears, so several concurrent tasks each get their own live
-     row instead of one shared slot overwriting itself — that overwrite
-     was the actual bug behind the old single-chip version only ever
-     reading as "on" sometimes. -------------------------------------- */
-  let panelEl = null, rowsEl = null, headCountEl = null;
-  let panelShown = false;
-  const rowEls = new Map();   // task id -> row element
-  let dragging = false, dragDX = 0, dragDY = 0;
+     Background rows are diffed by id (AV.tasks[i].id, the SDK's own
+     tool_use_id): a row is created once when its id first appears and
+     removed once its id disappears, so several concurrent tasks each get
+     their own live row instead of one shared slot overwriting itself —
+     that overwrite was the actual bug behind the old single-chip version
+     only ever reading as "on" sometimes.
+
+     Nothing here is fabricated: the only timer shown (current-task
+     elapsed) comes from the task's own real start time (ts), and it's
+     simply absent when there's no task to time, never a fake number. */
+  let panelEl = null, barEl = null, dotEl = null, labelEl = null,
+      currentEl = null, badgeEl = null, chevronEl = null, waveEl = null,
+      expandedEl = null, curSectionEl = null, bgSectionEl = null,
+      bgRowsEl = null, bgBadgeEl = null;
+  let expanded = false;
+  const rowEls = new Map();   // task id -> background row element
+  const WAVE_BARS = 5;
+  let dragging = false, dragDX = 0, dragDY = 0, dragMoved = false;
 
   function panelPos() {
     try {
@@ -311,74 +328,164 @@ const AV = (() => {
       if (saved && typeof saved.top === "number" && typeof saved.left === "number")
         return saved;
     } catch (e) {}
-    return { top: 90, left: 24 };   // left side, clear of most faces' chrome
+    return { top: 20, left: 24 };   // top-left, clear of most faces' chrome
   }
   function panelSavePos(top, left) {
     try { localStorage.setItem("av_tasklist_pos", JSON.stringify({ top, left })); }
     catch (e) {}
+  }
+  function expandedPref() {
+    try { return localStorage.getItem("av_tasklist_expanded") === "1"; }
+    catch (e) { return false; }
+  }
+  function expandedSave(on) {
+    try { localStorage.setItem("av_tasklist_expanded", on ? "1" : "0"); }
+    catch (e) {}
+  }
+
+  function fmtElapsed(s) {
+    s = Math.max(0, Math.round(s));
+    const m = Math.floor(s / 60), r = s % 60;
+    return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
   }
 
   function taskListInit() {
     if (SHOT) return;
     const style = document.createElement("style");
     style.textContent = `
-      @keyframes av-task-dot { 0%,100%{opacity:.4} 50%{opacity:1} }
-      @keyframes av-task-ellipsis { 0%,100%{opacity:.25} 50%{opacity:1} }
+      @keyframes av-task-dot { 0%,100%{opacity:.45} 50%{opacity:1} }
+      @keyframes av-task-spin { to{transform:rotate(360deg)} }
+      @keyframes av-task-wave-idle { 0%,100%{transform:scaleY(.3)} 50%{transform:scaleY(1)} }
       @keyframes av-task-row-in {
-        from{opacity:0;transform:translateX(-6px)} to{opacity:1;transform:translateX(0)} }
-      #av-task-panel{position:fixed;z-index:60;min-width:190px;max-width:300px;
-        background:rgba(8,12,22,.78);border:1px solid rgba(120,160,210,.32);
-        border-radius:10px;padding:10px 14px 11px;
-        box-shadow:0 0 22px rgba(90,190,255,.14),0 4px 18px rgba(0,0,0,.35);
+        from{opacity:0;transform:translateY(-4px)} to{opacity:1;transform:translateY(0)} }
+      #av-task-panel{position:fixed;z-index:60;min-width:260px;max-width:420px;
         font:12px "SF Mono",Menlo,Consolas,monospace;color:rgba(230,238,250,.92);
-        cursor:grab;user-select:none;opacity:0;pointer-events:none;
-        transform:translateY(-4px);transition:opacity .25s,transform .25s;}
-      #av-task-panel.on{opacity:1;pointer-events:auto;transform:translateY(0)}
-      #av-task-panel.dragging{cursor:grabbing;transition:none}
-      #av-task-panel .av-task-head{display:flex;align-items:center;gap:7px;
-        letter-spacing:.2em;font-size:10px;color:rgba(150,200,240,.85)}
-      #av-task-panel .av-task-dot{width:6px;height:6px;border-radius:50%;flex:none;
-        background:rgba(110,200,255,.95);animation:av-task-dot 1.1s ease-in-out infinite}
-      #av-task-panel .av-task-rows{margin-top:7px;display:flex;
-        flex-direction:column;gap:5px}
-      #av-task-panel .av-task-row{display:flex;align-items:baseline;gap:7px;
-        animation:av-task-row-in .22s ease-out}
-      #av-task-panel .av-task-row-label{font-size:12px;color:rgba(230,238,250,.92);
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
-      #av-task-panel .av-task-row-dots{display:inline-flex;gap:2px;flex:none}
-      #av-task-panel .av-task-row-dots i{width:3px;height:3px;border-radius:50%;
-        display:block;background:rgba(120,200,255,.85);
-        animation:av-task-ellipsis 1s ease-in-out infinite}
+        user-select:none;}
+      #av-task-bar{display:flex;align-items:center;gap:10px;
+        background:rgba(8,12,22,.82);border:1px solid rgba(120,160,210,.32);
+        border-radius:999px;padding:9px 14px;cursor:grab;
+        box-shadow:0 0 22px rgba(90,190,255,.14),0 4px 18px rgba(0,0,0,.35);}
+      #av-task-panel.dragging #av-task-bar{cursor:grabbing}
+      #av-task-dot{width:7px;height:7px;border-radius:50%;flex:none;
+        background:rgba(130,140,155,.65);animation:av-task-dot 1.6s ease-in-out infinite}
+      #av-task-dot.st-listening{background:rgba(110,230,160,.95)}
+      #av-task-dot.st-working,#av-task-dot.st-thinking{background:rgba(110,200,255,.95);
+        animation-duration:1s}
+      #av-task-dot.st-speaking{background:rgba(180,150,255,.95);animation-duration:.6s}
+      #av-task-label{letter-spacing:.18em;font-size:10px;font-weight:600;
+        color:rgba(150,200,240,.85);white-space:nowrap;flex:none}
+      #av-task-wave{display:inline-flex;align-items:center;gap:2px;height:14px;flex:none}
+      #av-task-wave i{width:2px;border-radius:1px;display:block;
+        background:rgba(120,200,255,.85);height:40%;
+        animation:av-task-wave-idle 1.4s ease-in-out infinite}
+      #av-task-divider{width:1px;align-self:stretch;background:rgba(120,160,210,.25);flex:none}
+      #av-task-current{font-size:12px;color:rgba(210,222,240,.85);flex:1 1 auto;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+      #av-task-badge{font-size:9px;letter-spacing:.14em;color:rgba(150,200,240,.85);
+        border:1px solid rgba(120,160,210,.35);border-radius:999px;
+        padding:3px 9px;flex:none;white-space:nowrap}
+      #av-task-badge:empty{display:none}
+      #av-task-chevron{flex:none;width:18px;height:18px;border:none;background:none;
+        color:rgba(150,200,240,.85);cursor:pointer;font-size:11px;
+        display:flex;align-items:center;justify-content:center;
+        transition:transform .2s;}
+      #av-task-panel.expanded #av-task-chevron{transform:rotate(180deg)}
+      #av-task-expanded{margin-top:6px;background:rgba(8,12,22,.82);
+        border:1px solid rgba(120,160,210,.32);border-radius:14px;
+        padding:12px 14px 10px;box-shadow:0 0 22px rgba(90,190,255,.14),0 4px 18px rgba(0,0,0,.35);
+        display:none;}
+      #av-task-panel.expanded #av-task-expanded{display:block}
+      .av-task-section-label{letter-spacing:.16em;font-size:9px;
+        color:rgba(140,160,185,.75);display:flex;align-items:center;
+        justify-content:space-between;margin-bottom:8px}
+      .av-task-mini-badge{font-size:9px;letter-spacing:.1em;color:rgba(150,200,240,.85);
+        border:1px solid rgba(120,160,210,.35);border-radius:999px;padding:2px 8px}
+      #av-task-cur-row{display:flex;align-items:center;gap:9px}
+      .av-task-spin{width:14px;height:14px;border-radius:50%;flex:none;
+        border:2px solid rgba(110,200,255,.22);border-top-color:rgba(110,200,255,.95);
+        animation:av-task-spin .9s linear infinite}
+      .av-task-row-label{font-size:12px;color:rgba(230,238,250,.92);flex:1 1 auto;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+      #av-task-cur-time{font-size:11px;color:rgba(150,200,240,.75);flex:none}
+      #av-task-cur-plain{font-size:12px;color:rgba(190,205,225,.75)}
+      #av-task-bg-section{margin-top:11px;padding-top:10px;
+        border-top:1px solid rgba(120,160,210,.2)}
+      #av-task-bg-rows{display:flex;flex-direction:column;gap:9px}
+      .av-task-bg-row{display:flex;align-items:center;gap:9px;
+        animation:av-task-row-in .2s ease-out}
+      .av-task-bg-row-status{font-size:10px;color:rgba(140,160,185,.65);flex:none}
     `;
     document.head.appendChild(style);
 
     panelEl = document.createElement("div");
     panelEl.id = "av-task-panel";
-    const head = document.createElement("div");
-    head.className = "av-task-head";
-    head.innerHTML = `<span class="av-task-dot"></span><span>WORKING</span>` +
-      `<span class="av-task-head-count"></span>`;
-    headCountEl = head.querySelector(".av-task-head-count");
-    rowsEl = document.createElement("div");
-    rowsEl.className = "av-task-rows";
-    panelEl.appendChild(head);
-    panelEl.appendChild(rowsEl);
+
+    barEl = document.createElement("div");
+    barEl.id = "av-task-bar";
+    dotEl = document.createElement("span"); dotEl.id = "av-task-dot";
+    labelEl = document.createElement("span"); labelEl.id = "av-task-label";
+    waveEl = document.createElement("span"); waveEl.id = "av-task-wave";
+    for (let i = 0; i < WAVE_BARS; i++) {
+      const bar = document.createElement("i");
+      bar.style.animationDelay = (i * 0.11).toFixed(2) + "s";
+      waveEl.appendChild(bar);
+    }
+    const divider = document.createElement("span"); divider.id = "av-task-divider";
+    currentEl = document.createElement("span"); currentEl.id = "av-task-current";
+    badgeEl = document.createElement("span"); badgeEl.id = "av-task-badge";
+    chevronEl = document.createElement("button"); chevronEl.id = "av-task-chevron";
+    chevronEl.type = "button";
+    chevronEl.textContent = "⌄";
+    barEl.append(dotEl, labelEl, waveEl, divider, currentEl, badgeEl, chevronEl);
+
+    expandedEl = document.createElement("div");
+    expandedEl.id = "av-task-expanded";
+    curSectionEl = document.createElement("div");
+    curSectionEl.innerHTML = `<div class="av-task-section-label">CURRENT TASK</div>`;
+    const curRow = document.createElement("div");
+    curRow.id = "av-task-cur-row";
+    curSectionEl.appendChild(curRow);
+    bgSectionEl = document.createElement("div");
+    bgSectionEl.id = "av-task-bg-section";
+    bgSectionEl.innerHTML =
+      `<div class="av-task-section-label"><span>BACKGROUND TASKS</span>` +
+      `<span class="av-task-mini-badge" id="av-task-bg-badge"></span></div>`;
+    bgRowsEl = document.createElement("div");
+    bgRowsEl.id = "av-task-bg-rows";
+    bgSectionEl.appendChild(bgRowsEl);
+    bgBadgeEl = bgSectionEl.querySelector("#av-task-bg-badge");
+    expandedEl.append(curSectionEl, bgSectionEl);
+
+    panelEl.append(barEl, expandedEl);
     document.body.appendChild(panelEl);
+
+    if (expandedPref() || Q.get("expanded") === "1") {
+      expanded = true; panelEl.classList.add("expanded");
+    }
 
     const p = panelPos();
     panelEl.style.top = p.top + "px";
     panelEl.style.left = p.left + "px";
 
-    panelEl.addEventListener("pointerdown", e => {
+    chevronEl.addEventListener("pointerdown", e => e.stopPropagation());
+    chevronEl.addEventListener("click", () => {
+      expanded = !expanded;
+      panelEl.classList.toggle("expanded", expanded);
+      expandedSave(expanded);
+    });
+
+    barEl.addEventListener("pointerdown", e => {
       dragging = true;
+      dragMoved = false;
       panelEl.classList.add("dragging");
-      panelEl.setPointerCapture(e.pointerId);
+      barEl.setPointerCapture(e.pointerId);
       const r = panelEl.getBoundingClientRect();
       dragDX = e.clientX - r.left;
       dragDY = e.clientY - r.top;
     });
-    panelEl.addEventListener("pointermove", e => {
+    barEl.addEventListener("pointermove", e => {
       if (!dragging) return;
+      dragMoved = true;
       const left = Math.min(innerWidth - 40, Math.max(0, e.clientX - dragDX));
       const top = Math.min(innerHeight - 30, Math.max(0, e.clientY - dragDY));
       panelEl.style.left = left + "px";
@@ -388,58 +495,114 @@ const AV = (() => {
       if (!dragging) return;
       dragging = false;
       panelEl.classList.remove("dragging");
-      const r = panelEl.getBoundingClientRect();
-      panelSavePos(r.top, r.left);
+      if (dragMoved) {
+        const r = panelEl.getBoundingClientRect();
+        panelSavePos(r.top, r.left);
+      }
     };
-    panelEl.addEventListener("pointerup", stopDrag);
-    panelEl.addEventListener("pointercancel", stopDrag);
+    barEl.addEventListener("pointerup", stopDrag);
+    barEl.addEventListener("pointercancel", stopDrag);
   }
 
-  function taskListMakeRow(label) {
+  function taskListMakeBgRow(label) {
     const row = document.createElement("div");
-    row.className = "av-task-row";
-    const dots = document.createElement("span");
-    dots.className = "av-task-row-dots";
-    for (let i = 0; i < 3; i++) {
-      const d = document.createElement("i");
-      d.style.animationDelay = (i * 0.15).toFixed(2) + "s";
-      dots.appendChild(d);
-    }
+    row.className = "av-task-bg-row";
+    const spin = document.createElement("span");
+    spin.className = "av-task-spin";
     const lab = document.createElement("span");
     lab.className = "av-task-row-label";
     lab.textContent = label;
-    row.appendChild(dots);
-    row.appendChild(lab);
+    const status = document.createElement("span");
+    status.className = "av-task-bg-row-status";
+    status.textContent = "Running";
+    row.append(spin, lab, status);
     return row;
+  }
+
+  function stateWord() {
+    const st = A.state;
+    if (st === "thinking") return A.tasks.length ? "WORKING" : "THINKING";
+    if (st === "listening") return "LISTENING";
+    if (st === "speaking") return "SPEAKING";
+    return "IDLE";
+  }
+  function currentLine() {
+    if (A.tasks.length) return A.tasks[0].label;
+    switch (A.state) {
+      case "listening": return "Listening...";
+      case "thinking": return "Thinking...";
+      case "speaking": return "Replying...";
+      default: return "Standing by";
+    }
   }
 
   function taskListUpdate() {
     if (!panelEl) return;
     const tasks = A.tasks || [];
-    const liveIds = new Set(tasks.map(t => t.id));
+    const word = stateWord();
 
-    // remove rows for ids no longer active
-    for (const [id, row] of rowEls) {
-      if (!liveIds.has(id)) {
-        row.remove();
-        rowEls.delete(id);
+    dotEl.className = "st-" + word.toLowerCase();
+    labelEl.textContent = (A.name || "HUGO").toUpperCase() + " " + word;
+    currentEl.textContent = currentLine();
+    badgeEl.textContent = tasks.length > 1 ? `${tasks.length - 1} BACKGROUND` : "";
+
+    // mini waveform: real levels while speaking/listening, a gentle idle
+    // breathe otherwise — never a fake "working" animation dressed as data
+    const bars = waveEl.children;
+    if (A.state === "speaking" && A.samples) {
+      for (let i = 0; i < bars.length; i++) {
+        const v = A.samples[Math.floor(i * A.samples.length / bars.length)] || 0;
+        bars[i].style.animation = "none";
+        bars[i].style.transform = `scaleY(${Math.max(.15, Math.min(1, v))})`;
       }
+    } else if (A.state === "listening") {
+      for (let i = 0; i < bars.length; i++) {
+        bars[i].style.animation = "none";
+        bars[i].style.transform = `scaleY(${Math.max(.15, Math.min(1, A.micLevel || 0))})`;
+      }
+    } else {
+      for (let i = 0; i < bars.length; i++) bars[i].style.animation = "";
     }
-    // add rows for newly-seen ids, in the order the bus reports them
-    for (const t of tasks) {
+
+    // current-task section: a real task with its real elapsed time, or a
+    // plain state line when nothing is actually running
+    curSectionEl.querySelector(".av-task-section-label").textContent =
+      tasks.length ? "CURRENT TASK" : "STATUS";
+    const curRow = panelEl.querySelector("#av-task-cur-row");
+    curRow.innerHTML = "";
+    if (tasks.length) {
+      const spin = document.createElement("span");
+      spin.className = "av-task-spin";
+      const lab = document.createElement("span");
+      lab.className = "av-task-row-label";
+      lab.textContent = tasks[0].label;
+      const time = document.createElement("span");
+      time.id = "av-task-cur-time";
+      time.textContent = fmtElapsed(Date.now() / 1000 - (tasks[0].ts || Date.now() / 1000));
+      curRow.append(spin, lab, time);
+    } else {
+      const plain = document.createElement("span");
+      plain.id = "av-task-cur-plain";
+      plain.textContent = currentLine();
+      curRow.appendChild(plain);
+    }
+
+    // background rows: everything beyond the current task, diffed by id
+    // exactly like the old single-list panel did
+    const bg = tasks.slice(1);
+    const liveIds = new Set(bg.map(t => t.id));
+    for (const [id, row] of rowEls) {
+      if (!liveIds.has(id)) { row.remove(); rowEls.delete(id); }
+    }
+    for (const t of bg) {
       if (!rowEls.has(t.id)) {
-        const row = taskListMakeRow(t.label);
-        rowsEl.appendChild(row);
+        const row = taskListMakeBgRow(t.label);
+        bgRowsEl.appendChild(row);
         rowEls.set(t.id, row);
       }
     }
-
-    const shown = tasks.length > 0;
-    if (shown !== panelShown) {
-      panelShown = shown;
-      panelEl.classList.toggle("on", shown);
-    }
-    headCountEl.textContent = tasks.length > 1 ? ` · ${tasks.length}` : "";
+    bgSectionEl.style.display = bg.length ? "" : "none";
+    bgBadgeEl.textContent = bg.length ? `${bg.length} RUNNING` : "";
   }
 
   /* ------------------------------ shot harness ----------------------------- */
