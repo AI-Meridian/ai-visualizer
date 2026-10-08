@@ -316,9 +316,9 @@ const AV = (() => {
   let panelEl = null, barEl = null, dotEl = null, labelEl = null,
       currentEl = null, badgeEl = null, chevronEl = null, waveEl = null,
       expandedEl = null, curSectionEl = null, bgSectionEl = null,
-      bgRowsEl = null, bgBadgeEl = null;
+      bgRowsEl = null, bgBadgeEl = null, curProgEl = null;
   let expanded = false;
-  const rowEls = new Map();   // task id -> background row element
+  const rowEls = new Map();   // task id -> {wrap, progEl} background row
   const WAVE_BARS = 5;
   let dragging = false, dragDX = 0, dragDY = 0, dragMoved = false;
 
@@ -347,6 +347,40 @@ const AV = (() => {
     s = Math.max(0, Math.round(s));
     const m = Math.floor(s / 60), r = s % 60;
     return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+  }
+
+  // Below this, a job is "quick" — an elapsed-time spinner is enough,
+  // a progress bar would just be visual noise on a two-second Read.
+  const JOB_ETA_FLOOR_S = 20;
+
+  function taskProgressBuild() {
+    const wrap = document.createElement("div");
+    wrap.className = "av-task-progress-wrap";
+    wrap.style.display = "none";
+    const track = document.createElement("div");
+    track.className = "av-task-progress-track";
+    const fill = document.createElement("div");
+    fill.className = "av-task-progress-fill";
+    track.appendChild(fill);
+    const text = document.createElement("span");
+    text.className = "av-task-progress-text";
+    wrap.append(track, text);
+    return { wrap, fill, text };
+  }
+
+  // A real eta renders a live bar + "elapsed / ~eta" readout; no eta
+  // (or a too-short one) hides the whole element rather than showing a
+  // bar that's either always-empty or always-full.
+  function taskProgressSet(prog, ts, eta) {
+    if (!prog || !eta || eta < JOB_ETA_FLOOR_S || !ts) {
+      if (prog) prog.wrap.style.display = "none";
+      return;
+    }
+    const elapsed = Math.max(0, Date.now() / 1000 - ts);
+    const pct = Math.max(2, Math.min(100, (elapsed / eta) * 100));
+    prog.wrap.style.display = "";
+    prog.fill.style.width = pct.toFixed(1) + "%";
+    prog.text.textContent = fmtElapsed(elapsed) + " / ~" + fmtElapsed(eta);
   }
 
   function taskListInit() {
@@ -411,9 +445,17 @@ const AV = (() => {
       #av-task-bg-section{margin-top:11px;padding-top:10px;
         border-top:1px solid rgba(120,160,210,.2)}
       #av-task-bg-rows{display:flex;flex-direction:column;gap:9px}
-      .av-task-bg-row{display:flex;align-items:center;gap:9px;
-        animation:av-task-row-in .2s ease-out}
+      .av-task-bg-row{display:flex;align-items:center;gap:9px}
+      .av-task-bg-row-wrap{animation:av-task-row-in .2s ease-out}
       .av-task-bg-row-status{font-size:10px;color:rgba(140,160,185,.65);flex:none}
+      .av-task-progress-wrap{margin-top:5px}
+      .av-task-progress-track{height:3px;border-radius:2px;
+        background:rgba(255,255,255,.08);overflow:hidden}
+      .av-task-progress-fill{height:100%;border-radius:2px;
+        background:linear-gradient(90deg,rgba(110,200,255,.9),rgba(150,120,255,.9));
+        transition:width .5s linear}
+      .av-task-progress-text{font-size:9px;letter-spacing:.02em;
+        color:rgba(150,200,240,.65);display:block;margin-top:3px}
     `;
     document.head.appendChild(style);
 
@@ -445,6 +487,8 @@ const AV = (() => {
     const curRow = document.createElement("div");
     curRow.id = "av-task-cur-row";
     curSectionEl.appendChild(curRow);
+    curProgEl = taskProgressBuild();
+    curSectionEl.appendChild(curProgEl.wrap);
     bgSectionEl = document.createElement("div");
     bgSectionEl.id = "av-task-bg-section";
     bgSectionEl.innerHTML =
@@ -505,6 +549,8 @@ const AV = (() => {
   }
 
   function taskListMakeBgRow(label) {
+    const wrap = document.createElement("div");
+    wrap.className = "av-task-bg-row-wrap";
     const row = document.createElement("div");
     row.className = "av-task-bg-row";
     const spin = document.createElement("span");
@@ -516,7 +562,9 @@ const AV = (() => {
     status.className = "av-task-bg-row-status";
     status.textContent = "Running";
     row.append(spin, lab, status);
-    return row;
+    const progEl = taskProgressBuild();
+    wrap.append(row, progEl.wrap);
+    return { wrap, progEl };
   }
 
   function stateWord() {
@@ -580,26 +628,30 @@ const AV = (() => {
       time.id = "av-task-cur-time";
       time.textContent = fmtElapsed(Date.now() / 1000 - (tasks[0].ts || Date.now() / 1000));
       curRow.append(spin, lab, time);
+      taskProgressSet(curProgEl, tasks[0].ts, tasks[0].eta);
     } else {
       const plain = document.createElement("span");
       plain.id = "av-task-cur-plain";
       plain.textContent = currentLine();
       curRow.appendChild(plain);
+      taskProgressSet(curProgEl, null, null);
     }
 
     // background rows: everything beyond the current task, diffed by id
     // exactly like the old single-list panel did
     const bg = tasks.slice(1);
     const liveIds = new Set(bg.map(t => t.id));
-    for (const [id, row] of rowEls) {
-      if (!liveIds.has(id)) { row.remove(); rowEls.delete(id); }
+    for (const [id, entry] of rowEls) {
+      if (!liveIds.has(id)) { entry.wrap.remove(); rowEls.delete(id); }
     }
     for (const t of bg) {
-      if (!rowEls.has(t.id)) {
-        const row = taskListMakeBgRow(t.label);
-        bgRowsEl.appendChild(row);
-        rowEls.set(t.id, row);
+      let entry = rowEls.get(t.id);
+      if (!entry) {
+        entry = taskListMakeBgRow(t.label);
+        bgRowsEl.appendChild(entry.wrap);
+        rowEls.set(t.id, entry);
       }
+      taskProgressSet(entry.progEl, t.ts, t.eta);
     }
     bgSectionEl.style.display = bg.length ? "" : "none";
     bgBadgeEl.textContent = bg.length ? `${bg.length} RUNNING` : "";

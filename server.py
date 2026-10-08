@@ -27,11 +27,15 @@ Serves the face gallery at http://127.0.0.1:8790/ and exposes:
             "alert":  bool,          optional attention signal
             "loading": bool,         true while the voice line plays its
                                      own thinking sound (we stay quiet)
-            "tasks": [{"id": str, "label": str}, ...]}  every tool call
+            "tasks": [{"id": str, "label": str, "ts": float|None,
+                       "eta": float|None}, ...]}  every tool call
                                      currently executing, in plain
                                      English, while the brain works
-                                     quietly — can hold more than one
-                                     entry when the brain runs several
+                                     quietly — "ts"/"eta" let a face
+                                     show a real progress bar for a
+                                     long job, not just a spinner — can
+                                     hold more than one entry when the
+                                     brain runs several
                                      tool calls in parallel
   /config  the merged ai-visualizer.json plus the list of installed
            faces, discovered by scanning the faces/ folder. Drop a new
@@ -149,10 +153,16 @@ def mock_bus():
     return {"state": MOCK, "level": level, "samples": samples,
             "alert": False, "loading": MOCK == "thinking",
             # Faked so a face's task panel can be looked at without
-            # spending a real session to make it appear — two entries,
-            # so the multi-task list panel has something real to show.
-            "tasks": [{"id": "mock-1", "label": "Searching the web"},
-                      {"id": "mock-2", "label": "Reading a file"}]
+            # spending a real session to make it appear — three entries
+            # (a quick one with no eta, plus two long jobs at different
+            # points in their progress) so both the plain-spinner path
+            # and the real progress-bar path are both visible at once.
+            "tasks": [{"id": "mock-1", "label": "Searching the web",
+                       "ts": t - 1, "eta": None},
+                      {"id": "mock-2", "label": "Running a command",
+                       "ts": t - 240, "eta": 900},
+                      {"id": "mock-3", "label": "Reading a file",
+                       "ts": t - 3, "eta": None}]
                     if MOCK == "thinking" else [],
             # Faked so the usage readout can be looked at without
             # spending a real session to make it appear.
@@ -197,12 +207,19 @@ def read_bus():
         for entry in payload:
             label = entry.get("label")
             tid = entry.get("id")
-            age = now - float(entry.get("ts", 0))
+            ts = entry.get("ts")
+            eta = entry.get("eta")
+            age = now - float(ts or 0)
             # Per-entry staleness, not all-or-nothing: one stuck task
             # (a killed subprocess that never fired its PostToolUse
             # hook) shouldn't hide every other genuinely-running task.
-            if label and tid is not None and age < TASK_STALE_S:
-                tasks.append({"id": str(tid), "label": str(label)})
+            # A real long job (a genuine eta) gets a proportionally
+            # longer leash before the safety net assumes it's dead —
+            # otherwise a real 15-minute job would get hidden at 30s.
+            stale_limit = max(TASK_STALE_S, (eta or 0) * 1.5)
+            if label and tid is not None and age < stale_limit:
+                tasks.append({"id": str(tid), "label": str(label),
+                              "ts": ts, "eta": eta})
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     # Absent unless the voice line was told to publish it, which is the
