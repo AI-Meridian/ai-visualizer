@@ -40,6 +40,11 @@
                    expandable to show the current task plus every other
                    one running in the background, each timed off its
                    own real start (ts), never a fabricated percentage.
+     AV.lastCompleted  {id, label, completed_ts} | null — the most
+                   recently FINISHED task. Drives a persistent green
+                   "last done" chip above the status bar, always on
+                   screen once anything has completed this run,
+                   replaced (never cleared) by the next completion.
      AV.micLevel   0..1 your microphone (only if init({mic:true}))
      AV.name       display name from config ("JARVIS" by default)
      AV.label      the dotted chip label ("J.A.R.V.I.S.")
@@ -116,7 +121,7 @@ const AV = (() => {
   // A scripted voice turn: the face performs everything with no voice line.
   const SCRIPT = [["idle", 6000], ["listening", 3500], ["thinking", 4200],
                   ["speaking", 8500]];
-  let demoT = 0, demoClock = 0;
+  let demoT = 0, demoClock = 0, demoPrevState = "idle", demoLastDone = null;
   const PIN = SHOT || Q.get("state");   // ?state=speaking pins the demo
   function demoUpdate(dt) {
     demoClock += dt;
@@ -157,7 +162,17 @@ const AV = (() => {
                    ts: Date.now() / 1000 - elapsedMs / 1000 },
                  { id: "demo-2", label: "Reading a file",
                    ts: Date.now() / 1000 - elapsedMs / 2000 }]
-              : [] };
+              : [],
+            last_completed: demoLastDone };
+    // Fabricate one completion each time the scripted loop leaves
+    // "thinking", so the demo honestly shows the persistent chip too —
+    // same id/label pattern as the fake in-progress tasks above, never
+    // pretending to be a real result.
+    if (demoPrevState === "thinking" && st !== "thinking") {
+      demoLastDone = { id: "demo-done-" + Math.floor(tt),
+                        label: "Read a file", completed_ts: tt };
+    }
+    demoPrevState = st;
     if (st === "listening")
       A.micLevel = 0.25 + 0.55 * Math.abs(Math.sin(tt * 2.7))
         * Math.abs(Math.sin(tt * 0.61));
@@ -170,6 +185,7 @@ const AV = (() => {
     A.state = raw.state || "idle";
     A.alert = !!raw.alert;
     A.tasks = raw.tasks || [];
+    A.lastCompleted = raw.last_completed || null;
     taskListUpdate();
     // Empty unless the voice line was told to publish usage. A face that
     // wants to draw it reads AV.rateLimits; every other face ignores it.
@@ -316,7 +332,8 @@ const AV = (() => {
   let panelEl = null, barEl = null, dotEl = null, labelEl = null,
       currentEl = null, badgeEl = null, chevronEl = null, waveEl = null,
       expandedEl = null, curSectionEl = null, bgSectionEl = null,
-      bgRowsEl = null, bgBadgeEl = null, curProgEl = null;
+      bgRowsEl = null, bgBadgeEl = null, curProgEl = null,
+      lastDoneEl = null, lastDoneLabelEl = null;
   let expanded = false;
   const rowEls = new Map();   // task id -> {wrap, progEl} background row
   const WAVE_BARS = 5;
@@ -456,6 +473,17 @@ const AV = (() => {
         transition:width .5s linear}
       .av-task-progress-text{font-size:9px;letter-spacing:.02em;
         color:rgba(150,200,240,.65);display:block;margin-top:3px}
+      #av-task-lastdone{display:none;align-items:center;gap:8px;
+        background:rgba(8,12,22,.82);border:1px solid rgba(110,230,160,.35);
+        border-radius:999px;padding:7px 14px;margin-bottom:8px;max-width:420px;
+        box-shadow:0 0 16px rgba(110,230,160,.12),0 4px 14px rgba(0,0,0,.35);}
+      #av-task-lastdone.av-task-row-in{animation:av-task-row-in .25s ease-out}
+      #av-task-lastdone-check{flex:none;width:14px;height:14px;border-radius:50%;
+        background:rgba(110,230,160,.18);color:rgba(110,230,160,.95);
+        font-size:9px;font-weight:700;display:flex;align-items:center;
+        justify-content:center;line-height:1}
+      #av-task-lastdone-label{font-size:11px;color:rgba(210,222,240,.88);
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
     `;
     document.head.appendChild(style);
 
@@ -500,7 +528,16 @@ const AV = (() => {
     bgBadgeEl = bgSectionEl.querySelector("#av-task-bg-badge");
     expandedEl.append(curSectionEl, bgSectionEl);
 
-    panelEl.append(barEl, expandedEl);
+    lastDoneEl = document.createElement("div");
+    lastDoneEl.id = "av-task-lastdone";
+    const lastDoneCheck = document.createElement("span");
+    lastDoneCheck.id = "av-task-lastdone-check";
+    lastDoneCheck.textContent = "✓";
+    lastDoneLabelEl = document.createElement("span");
+    lastDoneLabelEl.id = "av-task-lastdone-label";
+    lastDoneEl.append(lastDoneCheck, lastDoneLabelEl);
+
+    panelEl.append(lastDoneEl, barEl, expandedEl);
     document.body.appendChild(panelEl);
 
     if (expandedPref() || Q.get("expanded") === "1") {
@@ -588,6 +625,26 @@ const AV = (() => {
     if (!panelEl) return;
     const tasks = A.tasks || [];
     const word = stateWord();
+
+    // Persistent "last done" chip — always visible once anything has
+    // finished this run, replaced (never cleared) by the next
+    // completion. One real result at a time, not an accreting log; a
+    // genuine key change (not just the same completion polled again)
+    // is what triggers the pop-in so it doesn't re-animate every 120ms.
+    const lc = A.lastCompleted;
+    if (lc && lc.label) {
+      const key = lc.id + "|" + lc.completed_ts;
+      if (lastDoneEl.dataset.key !== key) {
+        lastDoneEl.dataset.key = key;
+        lastDoneLabelEl.textContent = lc.label;
+        lastDoneEl.classList.remove("av-task-row-in");
+        void lastDoneEl.offsetWidth;   // restart the animation
+        lastDoneEl.classList.add("av-task-row-in");
+      }
+      lastDoneEl.style.display = "flex";
+    } else {
+      lastDoneEl.style.display = "none";
+    }
 
     dotEl.className = "st-" + word.toLowerCase();
     labelEl.textContent = (A.name || "HUGO").toUpperCase() + " " + word;

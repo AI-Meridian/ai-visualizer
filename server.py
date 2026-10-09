@@ -37,6 +37,12 @@ Serves the face gallery at http://127.0.0.1:8790/ and exposes:
                                      hold more than one entry when the
                                      brain runs several
                                      tool calls in parallel
+            "last_completed": {"id": str, "label": str,
+                       "completed_ts": float} | None  the most recently
+                                     FINISHED task, kept on screen after
+                                     it leaves "tasks" so a face can show
+                                     a persistent "last done" row instead
+                                     of a result that just vanishes
   /config  the merged ai-visualizer.json plus the list of installed
            faces, discovered by scanning the faces/ folder. Drop a new
            folder with an index.html into faces/ and it appears in the
@@ -51,6 +57,8 @@ voice line (backtalk writes them natively, github.com/jaredrhod/backtalk):
   .voice_alert        optional: non-empty file = attention needed
   .voice_task         optional: JSON list of {id, ts, label}, one entry
                        per tool call currently executing
+  .voice_task_completed  optional: JSON {id, label, completed_ts} for
+                       the most recently finished task
 
 Where the bus lives comes from "bus_dir" in ai-visualizer.json (default:
 this folder). Point it at your backtalk folder, or point backtalk's
@@ -164,6 +172,11 @@ def mock_bus():
                       {"id": "mock-3", "label": "Reading a file",
                        "ts": t - 3, "eta": None}]
                     if MOCK == "thinking" else [],
+            # Faked so the persistent "last done" chip can be looked at
+            # without spending a real session to make it appear.
+            "last_completed": {"id": "mock-done-1",
+                                "label": "Checked the shared vault state",
+                                "completed_ts": t - 14},
             # Faked so the usage readout can be looked at without
             # spending a real session to make it appear.
             "rate_limits": {
@@ -227,6 +240,15 @@ def read_bus():
                               "ts": ts, "eta": eta})
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
+    last_completed = None
+    try:
+        payload = json.loads((BUS / ".voice_task_completed").read_text())
+        if payload.get("label") and payload.get("id") is not None:
+            last_completed = {"id": str(payload["id"]),
+                               "label": str(payload["label"]),
+                               "completed_ts": payload.get("completed_ts")}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     # Absent unless the voice line was told to publish it, which is the
     # normal case: it is the account holder's own spend and it stays off
     # until asked for. An empty dict simply means no readout.
@@ -237,7 +259,7 @@ def read_bus():
         pass
     return {"state": state, "level": level, "samples": samples,
             "alert": alert, "loading": loading, "tasks": tasks,
-            "rate_limits": rate_limits}
+            "last_completed": last_completed, "rate_limits": rate_limits}
 
 
 class Handler(BaseHTTPRequestHandler):
