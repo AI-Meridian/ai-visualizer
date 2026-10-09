@@ -209,7 +209,12 @@ def read_bus():
             tid = entry.get("id")
             ts = entry.get("ts")
             eta = entry.get("eta")
-            age = now - float(ts or 0)
+            # A background agent (no eta, open-ended runtime) carries
+            # its own `hb` heartbeat, refreshed independently of `ts` —
+            # staleness reads `hb` when present so the elapsed-time
+            # display below (built off `ts`) still reports the real
+            # time since the agent actually started, not a reset clock.
+            age = now - float(entry.get("hb") or ts or 0)
             # Per-entry staleness, not all-or-nothing: one stuck task
             # (a killed subprocess that never fired its PostToolUse
             # hook) shouldn't hide every other genuinely-running task.
