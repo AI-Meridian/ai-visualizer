@@ -12,9 +12,15 @@ main() {
 
   if [ ! -d .git ]; then
     # this folder arrived as a zip: wire it to updates, once, keeping the config
+    #
+    # Wired to the AI-Meridian fork, not upstream jaredrhod/ai-visualizer:
+    # this IS the Meridian fork, carrying real fixes upstream never gets.
+    # A seat whose .git ever went missing and ran this script would
+    # otherwise silently re-wire itself to vanilla upstream on the next
+    # pull, losing every Meridian fix and all branding with no warning.
     [ -f "$CFG" ] && cp "$CFG" "$CFG.mine"
     git init -q -b main
-    git remote add origin https://github.com/jaredrhod/ai-visualizer
+    git remote add origin https://github.com/AI-Meridian/ai-visualizer
     git fetch -q origin
     git reset -q --hard origin/main
     git branch -q --set-upstream-to=origin/main main
