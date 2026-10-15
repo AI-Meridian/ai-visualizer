@@ -76,10 +76,12 @@ Ctrl-C stops.
 import json
 import math
 import mimetypes
+import secrets
 import sys
 import threading
 import time
 import webbrowser
+import urllib.parse
 import urllib.request
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -89,6 +91,42 @@ HERE = Path(__file__).resolve().parent
 STATES = {"idle", "listening", "thinking", "speaking"}
 WAVEFORM_STALE_S = 0.6
 TASK_STALE_S = 30.0   # safety net: an unclearable stuck label expires
+
+# Binding to 127.0.0.1 only keeps this off the network, but on a shared
+# machine ANY local process under ANY OS account can still open a socket
+# to localhost -- normal per-user file permissions don't apply to a TCP
+# port the way they do to a home folder. /state's task labels can carry
+# real file paths, search terms and command text, so a per-process
+# random token gates the two endpoints that actually say anything. The
+# legitimate browser tab gets it the only way a sandboxed renderer
+# (contextIsolation, no filesystem access) safely can: baked into the
+# URL this same process launches it with, never fetched over HTTP where
+# a second local user could just ask for it too.
+#
+# Persisted to disk, not regenerated per launch: a relaunch while the
+# old server is still running headless (see the "already running"
+# branch below) needs to open a URL THAT SERVER will accept, which only
+# works if both processes agree on the same token.
+_TOKEN_FILE = HERE / ".visualizer_token"
+
+
+def _load_or_make_token() -> str:
+    try:
+        existing = _TOKEN_FILE.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    t = secrets.token_urlsafe(24)
+    _TOKEN_FILE.write_text(t)
+    try:
+        _TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return t
+
+
+TOKEN = _load_or_make_token()
 
 DEFAULTS = {
     "name": "JARVIS",       # shown on the chip / headers, yours to change
@@ -263,9 +301,18 @@ def read_bus():
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _authed(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        given = (qs.get("token") or [""])[0]
+        return secrets.compare_digest(given, TOKEN)
+
     def do_GET(self):
         path = self.path.split("?")[0]
         try:
+            if path in ("/state", "/config") and not self._authed():
+                self._send(json.dumps({"error": "missing or bad token"}).encode(),
+                           "application/json", 403)
+                return
             if path == "/state":
                 self._send(json.dumps(read_bus()).encode(),
                            "application/json")
@@ -329,7 +376,8 @@ if __name__ == "__main__":
     root = f"http://127.0.0.1:{PORT}/"
     # The browser opens on the configured face; the gallery stays at "/" for switching.
     face = CFG.get("face", "")
-    url = f"{root}faces/{face}/" if face and (HERE / "faces" / face / "index.html").exists() else root
+    base = f"{root}faces/{face}/" if face and (HERE / "faces" / face / "index.html").exists() else root
+    url = f"{base}?token={TOKEN}"
     # ALREADY RUNNING IS NOT AN ERROR, and treating it as one was the whole
     # bug. Closing the browser tab does not stop this server; it keeps going
     # headless. Relaunching then failed to bind, died before the line that
@@ -346,7 +394,8 @@ if __name__ == "__main__":
         # deserves a different sentence.
         mine = False
         try:
-            with urllib.request.urlopen(root + "state", timeout=2) as r:
+            with urllib.request.urlopen(
+                    f"{root}state?token={TOKEN}", timeout=2) as r:
                 mine = r.status == 200
         except Exception:
             mine = False

@@ -85,7 +85,7 @@ AV.init({sound:false});
 AV.ready(a=>{
   document.getElementById("who").textContent=a.name.toUpperCase();
   const faces=(a.faces&&a.faces.length)?a.faces:FALLBACK;
-  fetch("/config",{cache:"no-store"}).then(r=>r.json())
+  fetch(AV.withToken("/config"),{cache:"no-store"}).then(r=>r.json())
     .then(c=>{deflt=c.face||"board";render(faces)})
     .catch(()=>render(faces));
 });
@@ -95,7 +95,7 @@ function render(faces){
   faces.forEach((f,i)=>{
     const a=document.createElement("a");
     a.className="card";
-    a.href=`faces/${f.id}/index.html`;
+    a.href=AV.withToken(`faces/${f.id}/index.html`);
     a.innerHTML=`<span class="n">${f.title||f.id}</span>`+
       (f.id===deflt?`<span class="def">DEFAULT</span>`:"")+
       `<span class="key">${i+1}</span>`+
@@ -107,7 +107,7 @@ function render(faces){
     });
     cards.appendChild(a);
     addEventListener("keydown",e=>{
-      if(e.key===String(i+1))location.href=`faces/${f.id}/index.html`;
+      if(e.key===String(i+1))location.href=AV.withToken(`faces/${f.id}/index.html`);
     });
   });
 }

@@ -74,6 +74,11 @@ const AV = (() => {
   const SHOT = Q.get("shot");
   const SHOT_T = parseInt(Q.get("t") || "4000", 10);
   const DEMO = Q.get("demo") === "1" || location.protocol === "file:" || !!SHOT;
+  // server.py gates /state and /config on this: it's baked into the URL
+  // the server itself launched the browser with, the one safe channel a
+  // sandboxed renderer has, since it can't read a local token file.
+  const TOKEN = Q.get("token") || "";
+  const withToken = path => TOKEN ? `${path}?token=${encodeURIComponent(TOKEN)}` : path;
 
   // where core.js lives -> where assets/ lives (works over http and file://)
   const ROOT = new URL(".", document.currentScript.src);
@@ -82,7 +87,7 @@ const AV = (() => {
     state: "idle", level: 0, env: 0, alert: false, micLevel: 0,
     samples: new Float32Array(64), tasks: [],
     name: "JARVIS", label: "J.A.R.V.I.S.", badge: "",
-    demo: DEMO, shot: SHOT, faces: [],
+    demo: DEMO, shot: SHOT, faces: [], token: TOKEN, withToken,
     _sndOn: true, _mic: false, _readyCbs: [], _ready: false,
   };
 
@@ -111,7 +116,7 @@ const AV = (() => {
   if (!DEMO) {
     setInterval(async () => {
       try {
-        const r = await fetch("/state", { cache: "no-store" });
+        const r = await fetch(withToken("/state"), { cache: "no-store" });
         raw = await r.json();
       } catch (e) { /* server gone: hold last state */ }
     }, 120);
@@ -742,7 +747,7 @@ const AV = (() => {
     if (DEMO) {
       applyConfig({ name: Q.get("name") || "JARVIS" });
     } else {
-      fetch("/config", { cache: "no-store" })
+      fetch(withToken("/config"), { cache: "no-store" })
         .then(r => r.json()).then(applyConfig)
         .catch(() => applyConfig({}));
     }
