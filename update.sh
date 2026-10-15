@@ -31,6 +31,32 @@ main() {
   git fetch -q origin
   git log --oneline "..@{u}" 2>/dev/null | sed "s/^/  new: /"
 
+  # Every incoming commit must be signed by the trusted maintainer key
+  # before it's accepted, checked against THIS folder's own on-disk
+  # .allowed_signers (the last known-good copy, not whatever an
+  # incoming commit claims it should be) -- a compromised GitHub
+  # account/token can push over HTTPS auth alone, but can't forge a
+  # signature from a key that never touches GitHub. That's what
+  # actually stops a hijacked push from reaching a seat, not just logs
+  # it after the fact.
+  if [ -f .allowed_signers ]; then
+    BAD=0
+    for commit in $(git rev-list "HEAD..@{u}" 2>/dev/null); do
+      if ! git -c gpg.format=ssh \
+               -c gpg.ssh.allowedSignersFile="$(pwd)/.allowed_signers" \
+               verify-commit "$commit" >/dev/null 2>&1; then
+        BAD=1
+      fi
+    done
+    if [ "$BAD" = 1 ]; then
+      echo "  REFUSING TO UPDATE: the newest commit(s) on the remote are"
+      echo "  not signed by the trusted key. This can mean a compromised"
+      echo "  account pushed something bad -- not pulling it in. Tell Seb."
+      echo "update refused."
+      exit 1
+    fi
+  fi
+
   # one-time migration: the config moved out of git tracking. If git here
   # still tracks the old copy, lift yours aside, let the pull retire the
   # tracked one, then put yours back exactly as it was.
